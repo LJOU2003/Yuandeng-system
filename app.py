@@ -247,43 +247,48 @@ def verify_password_bcrypt(plain: str, hashed: str) -> bool:
 
 
 def get_account_page_by_username(username: str) -> dict | None:
-    """用員工姓名找帳號管理表那一筆 page（自動適配 title / rich_text）"""
+    """用員工姓名找帳號管理表那一筆 page（不依賴 schema；依序嘗試 title / rich_text）"""
     username = (username or "").strip()
     if not username:
         return None
 
+    # ✅ 雲端偶爾會因為 schema 讀取失敗而導致查不到帳號（進而「帳號或密碼錯誤」）
+    #   這裡改成「不依賴 notion.databases.retrieve」，直接嘗試兩種常見型態的 filter。
     try:
-        props = get_db_properties(ACCOUNT_DB_ID) or {}
-        p = props.get("員工姓名", {}) or {}
-        ptype = p.get("type")
-
-        if ptype == "title":
-            flt = {"property": "員工姓名", "title": {"equals": username}}
-        elif ptype == "rich_text":
-            flt = {"property": "員工姓名", "rich_text": {"equals": username}}
-        else:
-            # 找不到欄位或型態不是文字 → 直接查不到
-            return None
-
         res = notion.databases.query(
             database_id=ACCOUNT_DB_ID,
-            filter=flt,
+            filter={"property": "員工姓名", "title": {"equals": username}},
+            page_size=1,
+        )
+        results = res.get("results", [])
+        if results:
+            return results[0]
+    except Exception:
+        pass
+
+    try:
+        res = notion.databases.query(
+            database_id=ACCOUNT_DB_ID,
+            filter={"property": "員工姓名", "rich_text": {"equals": username}},
             page_size=1,
         )
         results = res.get("results", [])
         return results[0] if results else None
-
     except Exception:
         return None
-
 
 @st.cache_data(ttl=60)
 def get_db_properties(database_id: str) -> dict:
     try:
         db = notion.databases.retrieve(database_id=database_id)
         return db.get("properties", {}) or {}
-    except Exception:
+    except Exception as e:
+        # ✅ 佈署到 Streamlit Cloud 時，如果 secrets/token/權限或 DB_ID 有問題，這裡會失敗
+        #    開啟 DEBUG_NOTION=1 才顯示錯誤，避免一般使用者看到內部訊息
+        if os.getenv("DEBUG_NOTION", "").strip() == "1":
+            st.error(f"❌ Notion 讀取資料庫欄位失敗（{database_id}）：{e}")
         return {}
+
 
 
 @st.cache_data(ttl=60)
@@ -2053,49 +2058,64 @@ def resolve_salary_food_prop_name() -> str | None:
 def log_action(employee_name: str, action_type: str, action_content: str, result: str):
     """寫入「操作記錄表」：不強制欄位型態，盡力填入可用欄位。
     ✅ 重點：
-    - 永遠會寫入「title 欄位」（不管它叫什麼），避免雲端只出現空白列
-    - 其他欄位（員工姓名/操作類型/操作內容/操作結果/操作時間）依資料庫實際型態自動適配
+    - 盡力寫入 title 欄位（Notion DB 必有），避免出現「空白列」
+    - 如果抓不到 schema，也會用常見欄位名稱做 fallback 寫入（至少要留下一筆可追蹤紀錄）
     """
     if not OPLOG_DB_ID:
         return
 
-    employee_name = (employee_name or "").strip()
-    action_type = (action_type or "").strip()
-    action_content = (action_content or "").strip()
-    result = (result or "").strip()
+    emp = (employee_name or "").strip() or "—"
+    act = (action_type or "").strip() or "—"
+    content = (action_content or "").strip() or "—"
+    res_txt = (result or "").strip() or "—"
 
     try:
         props_meta = get_db_properties(OPLOG_DB_ID) or {}
-        if not props_meta:
-            # ✅ 取不到 schema（多半是雲端 secrets / token / 權限問題）時，不要寫入，避免產生空白列
-            return
         props: dict = {}
 
-        # 1) 一定要填 title 欄位（Notion DB 必有）
-        title_prop = _first_title_prop_name(props_meta)
-        if not title_prop:
-            # ✅ 找不到 title 欄位名稱就不要寫入，避免雲端生成空白列
-            return
-        if title_prop:
-            # 優先用員工姓名，沒有就用操作類型/內容當 title
-            title_value = employee_name or action_type or action_content or "—"
-            props[title_prop] = {"title": [{"text": {"content": str(title_value)}}]}
+        # 1) title 欄位（schema 有→找出 title 名稱；沒有→預設用「員工姓名」當 title）
+        title_prop = _first_title_prop_name(props_meta) or "員工姓名"
+        title_value = emp or act or "—"
+        props[title_prop] = {"title": [{"text": {"content": title_value}}]}
 
-        # 2) 其他欄位：依實際型態盡力寫入（不存在就略過）
-        _best_set_text(props, props_meta, "員工姓名", employee_name or "—")
-        _best_set_text(props, props_meta, "操作類型", action_type)
-        _best_set_text(props, props_meta, "操作內容", action_content)
-        _best_set_select(props, props_meta, OPLOG_DB_ID, "操作結果", result)
+        now_iso = datetime.now().isoformat()
 
-        # 3) 操作時間：如果你的欄位是 date，才手動寫入；若是 created_time 則 Notion 會自動填
-        if "操作時間" in props_meta:
-            p_type = (props_meta.get("操作時間", {}) or {}).get("type")
-            if p_type == "date":
-                props["操作時間"] = {"date": {"start": datetime.now().isoformat()}}
+        if props_meta:
+            # 2) schema 存在：用既有 helper 盡力寫入
+            _best_set_text(props, props_meta, "員工姓名", emp)
+            _best_set_text(props, props_meta, "操作類型", act)
+            _best_set_text(props, props_meta, "操作內容", content)
 
-        notion.pages.create(parent={"database_id": OPLOG_DB_ID}, properties=props)
-    except Exception:
+            # 操作結果（常見：select）
+            meta_r = (props_meta.get("操作結果") or {})
+            if meta_r.get("type") == "select" and res_txt:
+                props["操作結果"] = {"select": {"name": res_txt}}
+            else:
+                _best_set_text(props, props_meta, "操作結果", res_txt)
+
+            # 操作時間（常見：date）
+            meta_t = (props_meta.get("操作時間") or {})
+            if meta_t.get("type") == "date":
+                props["操作時間"] = {"date": {"start": now_iso}}
+        else:
+            # 3) schema 取不到：用「常見欄位名稱」直接寫入（盡量不要再產生空白列）
+            #    這些欄位若不存在或型態不同，Notion 會拒絕；因此這裡用 try/catch 包住
+            try:
+                props.setdefault("操作類型", {"rich_text": [{"text": {"content": act}}]})
+                props.setdefault("操作內容", {"rich_text": [{"text": {"content": content}}]})
+                # 操作結果常見是 select；若 DB 不是 select 會報錯，但至少 title 仍在
+                props.setdefault("操作結果", {"select": {"name": res_txt}})
+                props.setdefault("操作時間", {"date": {"start": now_iso}})
+            except Exception:
+                pass
+
+        notion.pages.create(database_id=OPLOG_DB_ID, properties=props)
+
+    except Exception as e:
+        if os.getenv("DEBUG_NOTION", "").strip() == "1":
+            st.error(f"❌ 寫入操作記錄失敗：{e}")
         return
+
 
 
 def list_operation_logs(limit: int = 200):
