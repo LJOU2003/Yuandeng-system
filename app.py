@@ -139,18 +139,32 @@ def verify_password_bcrypt(plain: str, hashed: str) -> bool:
 
 
 def get_account_page_by_username(username: str) -> dict | None:
-    """用員工姓名找帳號管理表那一筆 page"""
+    """用員工姓名找帳號管理表那一筆 page（自動適配 title / rich_text）"""
     username = (username or "").strip()
     if not username:
         return None
+
     try:
+        props = get_db_properties(ACCOUNT_DB_ID) or {}
+        p = props.get("員工姓名", {}) or {}
+        ptype = p.get("type")
+
+        if ptype == "title":
+            flt = {"property": "員工姓名", "title": {"equals": username}}
+        elif ptype == "rich_text":
+            flt = {"property": "員工姓名", "rich_text": {"equals": username}}
+        else:
+            # 找不到欄位或型態不是文字 → 直接查不到
+            return None
+
         res = notion.databases.query(
             database_id=ACCOUNT_DB_ID,
-            filter={"property": "員工姓名", "title": {"equals": username}},
+            filter=flt,
             page_size=1,
         )
         results = res.get("results", [])
         return results[0] if results else None
+
     except Exception:
         return None
 
