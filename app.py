@@ -6013,6 +6013,18 @@ else:
                     st.success("✅ 已重設！員工下次登入會被強制更改密碼。")
                     st.info("⚠️ 規則：Notion 會只保留『密碼』，並清空『login_hash』，避免同時存在。")
                     st.rerun()
+                # ==============================
+                # 🔎 Cloud Debug Mode（對齊這裡）
+                # ==============================
+
+                st.markdown("---")
+                st.subheader("🛠 雲端除錯模式（管理員專用）")
+
+                debug_on = st.checkbox("啟用除錯模式")
+
+                if debug_on:
+                    st.write("ACCOUNT_DB_ID:", ACCOUNT_DB_ID)
+                    st.write("OPLOG_DB_ID:", OPLOG_DB_ID)
 
         else:
             st.write("（建置中...）")
