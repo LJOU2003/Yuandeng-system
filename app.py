@@ -4110,18 +4110,26 @@ def create_lunch_record(employee_name: str, lunch_date: date, amount: float, act
         return False
 
     try:
-        props_meta = get_db_properties(LUNCH_DB_ID)
+        props_meta = get_db_properties(LUNCH_DB_ID) or {}
 
-        def has_prop(n: str) -> bool:
-            return n in (props_meta or {})
+        # 兼容：若先前曾快取到空的 properties（例如當時 DB ID/權限有誤），這裡再強制重抓一次
+        if not props_meta:
+            try:
+                _db = notion.databases.retrieve(database_id=LUNCH_DB_ID)
+                props_meta = _db.get("properties", {}) or {}
+            except Exception:
+                pass
 
-        props = {}
-        if has_prop("員工姓名"):
-            props["員工姓名"] = {"title": [{"text": {"content": employee_name}}]}
-        if has_prop("訂餐金額"):
-            props["訂餐金額"] = {"number": float(amount or 0)}
-        if has_prop("訂餐日期"):
-            props["訂餐日期"] = {"date": {"start": datetime.combine(lunch_date, datetime.min.time()).isoformat()}}
+        # 依資料庫實際欄位名稱做容錯（有些 Notion 欄位可能被改名）
+        k_emp = resolve_prop_key(props_meta, "員工姓名") or "員工姓名"
+        k_amount = resolve_prop_key(props_meta, "訂餐金額") or "訂餐金額"
+        k_date = resolve_prop_key(props_meta, "訂餐日期") or "訂餐日期"
+
+        props = {
+            k_emp: {"title": [{"text": {"content": employee_name}}]},
+            k_amount: {"number": float(amount or 0)},
+            k_date: {"date": {"start": datetime.combine(lunch_date, datetime.min.time()).isoformat()}},
+        }
 
         notion.pages.create(parent={"database_id": LUNCH_DB_ID}, properties=props)
         log_action(actor or employee_name, "午餐訂餐", f"{employee_name}｜{lunch_date.isoformat()}｜${float(amount or 0):.0f}", "成功")
