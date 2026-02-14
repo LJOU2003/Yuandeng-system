@@ -2437,8 +2437,8 @@ def login(username: str, password: str):
         page = get_account_page_by_username(username)
         if not page:
             if is_deploy_debug_enabled():
-                st.session_state["__debug_login"].update({\"stage\": \"account_not_found\", \"probe\": _debug_notion_account_probe(username)})
-            log_action(username, \"登入\", \"找不到帳號\", \"失敗\")
+                st.session_state["__debug_login"].update({"stage": "account_not_found", "probe": _debug_notion_account_probe(username)})
+            log_action(username, "登入", "找不到帳號", "失敗")
             return False, False, False
 
         page_id = page["id"]
