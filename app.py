@@ -117,6 +117,87 @@ def _rt_get_first_plain_text(prop: dict) -> str:
     return (rt[0].get("plain_text") or "").strip() if rt else ""
 
 
+
+def _get_prop_plain_text(prop: dict) -> str:
+    """更通用的 Notion 文字讀取：支援 title / rich_text / select / multi_select / number / checkbox."""
+    if not prop:
+        return ""
+    # title / rich_text
+    if "title" in prop:
+        arr = prop.get("title") or []
+        return (arr[0].get("plain_text") or "").strip() if arr else ""
+    if "rich_text" in prop:
+        arr = prop.get("rich_text") or []
+        return (arr[0].get("plain_text") or "").strip() if arr else ""
+    # select / multi_select
+    if "select" in prop and prop.get("select"):
+        return (prop["select"].get("name") or "").strip()
+    if "multi_select" in prop and prop.get("multi_select"):
+        ms = prop.get("multi_select") or []
+        return ", ".join([(x.get("name") or "").strip() for x in ms if x.get("name")])
+    # number / checkbox
+    if "number" in prop and prop.get("number") is not None:
+        return str(prop.get("number"))
+    if "checkbox" in prop and prop.get("checkbox") is not None:
+        return "True" if prop.get("checkbox") else "False"
+    return ""
+
+def _build_notion_prop_value(db_id: str, props_meta: dict, prop_name: str, value):
+    """依據資料庫欄位型態，自動組出 Notion API properties payload；不匹配就回傳 None（略過該欄位）。"""
+    meta = (props_meta or {}).get(prop_name, {}) or {}
+    ptype = meta.get("type")
+    if value is None:
+        value = ""
+    if isinstance(value, str):
+        value = value.strip()
+    # 文字類
+    if ptype == "title":
+        return {"title": [{"text": {"content": value or "—"}}]}
+    if ptype == "rich_text":
+        return {"rich_text": [{"text": {"content": value}}]} if value else {"rich_text": []}
+    if ptype in ("email", "url", "phone_number"):
+        return {ptype: value} if value else {ptype: None}
+    # 選單類
+    if ptype == "select":
+        if not value:
+            return None
+        options = get_select_options(db_id, prop_name) or []
+        if value in options:
+            return {"select": {"name": value}}
+        # 若選項不存在：改用第一個選項（避免整筆寫入失敗）
+        if options:
+            return {"select": {"name": options[0]}}
+        return None
+    if ptype == "multi_select":
+        if not value:
+            return None
+        # 支援以逗號分隔
+        if isinstance(value, str):
+            vals = [v.strip() for v in value.split(",") if v.strip()]
+        else:
+            vals = list(value) if isinstance(value, (list, tuple, set)) else []
+        options = set(get_select_options(db_id, prop_name) or [])
+        payload = [{"name": v} for v in vals if (not options) or (v in options)]
+        return {"multi_select": payload} if payload else None
+    # 日期
+    if ptype == "date":
+        # value 可傳 datetime / ISO string
+        if isinstance(value, datetime):
+            start = value.isoformat()
+        else:
+            start = str(value).strip()
+        return {"date": {"start": start}} if start else None
+    # 數值 / 勾選
+    if ptype == "number":
+        try:
+            return {"number": float(value)} if str(value).strip() != "" else None
+        except Exception:
+            return None
+    if ptype == "checkbox":
+        return {"checkbox": bool(value)}
+    return None
+
+
 def _title_get_first_plain_text(prop: dict) -> str:
     """Notion title 取第一段 plain_text"""
     t = (prop or {}).get("title", []) or []
@@ -1870,6 +1951,7 @@ def resolve_salary_food_prop_name() -> str | None:
 # ✅ 操作記錄表：寫入 / 讀取
 # =========================
 def log_action(employee_name: str, action_type: str, action_content: str, result: str):
+    """寫入操作記錄（自動依 Notion 欄位型態組 payload；欄位不存在就略過，不會因型態不符整筆失敗）。"""
     if not OPLOG_DB_ID:
         return
 
@@ -1880,34 +1962,32 @@ def log_action(employee_name: str, action_type: str, action_content: str, result
 
     try:
         props_meta = get_db_properties(OPLOG_DB_ID) or {}
-
-        def has_prop(n: str) -> bool:
-            return n in props_meta
-
         props = {}
 
-        if has_prop("員工姓名"):
-            props["員工姓名"] = {"title": [{"text": {"content": employee_name or "—"}}]}
+        # 依欄位型態自動塞值（title/rich_text/select/date...）
+        for k, v in [
+            ("員工姓名", employee_name or "—"),
+            ("操作類型", action_type),
+            ("操作內容", action_content),
+            ("操作結果", result),
+        ]:
+            if k in props_meta:
+                pv = _build_notion_prop_value(OPLOG_DB_ID, props_meta, k, v)
+                if pv is not None:
+                    props[k] = pv
 
-        if has_prop("操作類型"):
-            props["操作類型"] = {"rich_text": [{"text": {"content": action_type}}]} if action_type else {"rich_text": []}
-
-        if has_prop("操作內容"):
-            props["操作內容"] = {"rich_text": [{"text": {"content": action_content}}]} if action_content else {"rich_text": []}
-
-        if has_prop("操作結果"):
-            options = get_select_options(OPLOG_DB_ID, "操作結果") or []
-            if result in options:
-                props["操作結果"] = {"select": {"name": result}}
-
-        if has_prop("操作時間"):
-            p_type = (props_meta.get("操作時間", {}) or {}).get("type")
-            if p_type == "date":
-                props["操作時間"] = {"date": {"start": datetime.now().isoformat()}}
+        # 操作時間：若是 date 才寫入；若是 created_time/last_edited_time 則由 Notion 自動帶入
+        if "操作時間" in props_meta:
+            tmeta = props_meta.get("操作時間", {}) or {}
+            if tmeta.get("type") == "date":
+                pv = _build_notion_prop_value(OPLOG_DB_ID, props_meta, "操作時間", datetime.now())
+                if pv is not None:
+                    props["操作時間"] = pv
 
         notion.pages.create(parent={"database_id": OPLOG_DB_ID}, properties=props)
 
     except Exception:
+        # 操作記錄寫入失敗不影響主流程
         return
 
 
@@ -1924,8 +2004,10 @@ def list_operation_logs(limit: int = 200):
             sorts = [{"timestamp": "created_time", "direction": "descending"}]
         elif op_time_type == "last_edited_time":
             sorts = [{"timestamp": "last_edited_time", "direction": "descending"}]
-        else:
+        elif "操作時間" in props_meta:
             sorts = [{"property": "操作時間", "direction": "descending"}]
+        else:
+            sorts = [{"timestamp": "created_time", "direction": "descending"}]
 
         query = {
             "database_id": OPLOG_DB_ID,
@@ -1939,7 +2021,6 @@ def list_operation_logs(limit: int = 200):
                 return ""
             try:
                 dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-                # FIX: 轉台灣時區顯示，避免日期/時間偏移
                 if dt.tzinfo is not None:
                     dt = dt.astimezone(timezone(timedelta(hours=8)))
                 return dt.strftime("%Y-%m-%d %H:%M")
@@ -1950,40 +2031,24 @@ def list_operation_logs(limit: int = 200):
         for page in res.get("results", []):
             props = page.get("properties", {}) or {}
 
-            def get_title(name: str) -> str:
-                v = (props.get(name, {}) or {}).get("title", []) or []
-                return v[0].get("plain_text", "") if v else ""
-
-            def get_rich(name: str) -> str:
-                v = (props.get(name, {}) or {}).get("rich_text", []) or []
-                return v[0].get("plain_text", "") if v else ""
-
-            def get_select(name: str) -> str:
-                v = (props.get(name, {}) or {}).get("select")
-                return v.get("name", "") if v else ""
-
             def get_op_time() -> str:
                 p = props.get("操作時間", {}) or {}
-
                 d = p.get("date")
                 if d and d.get("start"):
                     return fmt_time(d.get("start", ""))
-
                 ct = p.get("created_time")
                 if ct:
                     return fmt_time(ct)
-
                 lt = p.get("last_edited_time")
                 if lt:
                     return fmt_time(lt)
-
                 return fmt_time(page.get("created_time", ""))
 
             rows.append({
-                "員工姓名": get_title("員工姓名"),
-                "操作類型": get_rich("操作類型"),
-                "操作內容": get_rich("操作內容"),
-                "操作結果": get_select("操作結果"),
+                "員工姓名": _get_prop_plain_text(props.get("員工姓名", {})),
+                "操作類型": _get_prop_plain_text(props.get("操作類型", {})),
+                "操作內容": _get_prop_plain_text(props.get("操作內容", {})),
+                "操作結果": _get_prop_plain_text(props.get("操作結果", {})),
                 "操作時間": get_op_time(),
             })
 
@@ -2015,8 +2080,8 @@ def update_password_and_logout(username: str, old_pwd: str, new_pwd: str, force:
     page_id = page["id"]
     props = page.get("properties", {}) or {}
 
-    login_hash = _rt_get_first_plain_text(props.get("login_hash", {}))
-    legacy_pwd = _rt_get_first_plain_text(props.get("密碼", {}))
+    login_hash = _get_prop_plain_text(props.get("login_hash", {}))
+    legacy_pwd = _get_prop_plain_text(props.get("密碼", {}))
 
     if not force:
         ok_old = False
@@ -2119,8 +2184,8 @@ def login(username: str, password: str):
         role = sel.get("name") if sel else None
         is_admin = (role == "管理員")
 
-        login_hash = _rt_get_first_plain_text(props.get("login_hash", {}))
-        legacy_pwd = _rt_get_first_plain_text(props.get("密碼", {}))
+        login_hash = _get_prop_plain_text(props.get("login_hash", {}))
+        legacy_pwd = _get_prop_plain_text(props.get("密碼", {}))
         must_change_flag = bool((props.get("must_change_password", {}) or {}).get("checkbox") or False)
 
         used_legacy = False
@@ -3423,11 +3488,11 @@ def get_attendance_status_map_by_date(attend_date: date) -> dict[str, str]:
             if ptype == "title":
                 return (_title_get_first_plain_text(p) or "").strip()
             if ptype == "rich_text":
-                return (_rt_get_first_plain_text(p) or "").strip()
+                return (_get_prop_plain_text(p) or "").strip()
             if ptype == "select":
                 return ((p.get("select") or {}).get("name") or "").strip()
             # fallback：多做一次容錯
-            return ((_title_get_first_plain_text(p) or _rt_get_first_plain_text(p) or "").strip())
+            return ((_title_get_first_plain_text(p) or _get_prop_plain_text(p) or "").strip())
 
         def _get_status(props: dict) -> str:
             p = props.get("出勤狀態", {}) or {}
