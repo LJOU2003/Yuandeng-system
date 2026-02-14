@@ -1,0 +1,8 @@
+streamlit>=1.32
+notion-client>=2.2.1
+python-dotenv>=1.0.0
+pandas>=2.0.0
+requests>=2.31.0
+bcrypt>=4.1.2
+streamlit-js-eval>=0.1.5
+altair>=5.2.0
