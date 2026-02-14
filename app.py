@@ -2217,11 +2217,13 @@ def resolve_salary_food_prop_name() -> str | None:
 # ✅ 操作記錄表：寫入 / 讀取
 # =========================
 def log_action(employee_name: str, action_type: str, action_content: str, result: str):
-    """寫入「操作記錄表」：不強制欄位型態，盡力填入可用欄位。
-    ✅ 重點：
-    - 盡力寫入 title 欄位（Notion DB 必有），避免出現「空白列」
-    - 依據 Notion schema 自動套用正確型態（特別是：status vs select），避免整筆寫入被拒絕
-    - 如果抓不到 schema，就只寫 title（最安全，至少不會 0 記錄）
+    """寫入「操作記錄表」(Operation Log)
+
+    你的「操作時間」是 Notion 的「建立時間(created_time)」欄位，所以它會自動出現；
+    目前只寫入了「員工姓名(title)」，原因通常是「抓不到 DB schema → props_meta 為空」導致只走最安全的 title 寫入。
+
+    這裡改成：先用 title 建立一筆(必成功)，再用 pages.update 逐欄位補寫
+    （逐欄位寫，避免某一欄型態不吻合導致整次 update 失敗）。
     """
     if not OPLOG_DB_ID:
         return
@@ -2231,55 +2233,54 @@ def log_action(employee_name: str, action_type: str, action_content: str, result
     content = (action_content or "").strip() or "—"
     res_txt = (result or "").strip() or "—"
 
+    def _debug_enabled() -> bool:
+        return str(os.getenv("DEPLOY_DEBUG", "")).strip() == "1" or str(os.getenv("DEBUG_NOTION", "")).strip() == "1"
+
+    def _safe_update(page_id: str, props: dict):
+        try:
+            notion.pages.update(page_id=page_id, properties=props)
+            return True, None
+        except Exception as e:
+            return False, e
+
     try:
+        # 1) 先建立最小可行列：只寫 title（Notion DB 一定有 title）
         props_meta = get_db_properties(OPLOG_DB_ID) or {}
-        props: dict = {}
-
-        # 1) title 欄位（schema 有→找出 title 名稱；沒有→預設用「員工姓名」當 title）
         title_prop = _first_title_prop_name(props_meta) or "員工姓名"
-        title_value = emp or act or "—"
-        props[title_prop] = {"title": [{"text": {"content": title_value}}]}
 
-        now_iso = datetime.now().isoformat()
+        create_props = {
+            title_prop: {"title": [{"text": {"content": emp or "—"}}]}
+        }
 
-        if props_meta:
-            # 員工姓名
-            _best_set_text(props, props_meta, "員工姓名", emp)
+        created = notion.pages.create(parent={"database_id": OPLOG_DB_ID}, properties=create_props)
+        page_id = created.get("id")
 
-            # 操作類型（可能是 select / status / rich_text）
-            meta_a = (props_meta.get("操作類型") or {})
-            t_a = meta_a.get("type")
-            if t_a == "select":
-                props["操作類型"] = {"select": {"name": act}}
-            elif t_a == "status":
-                props["操作類型"] = {"status": {"name": act}}
-            else:
-                _best_set_text(props, props_meta, "操作類型", act)
+        if not page_id:
+            # 理論上不會發生，但保底
+            if _debug_enabled():
+                st.error("❌ 操作記錄建立成功但拿不到 page_id（無法補寫欄位）")
+            return
 
-            # 操作內容
-            _best_set_text(props, props_meta, "操作內容", content)
+        # 2) 逐欄位補寫（即使抓不到 schema 也照寫；寫失敗就略過）
+        # 2-1) 操作類型：先試 status，再試 select，再試 rich_text
+        ok, err = _safe_update(page_id, {"操作類型": {"status": {"name": act}}})
+        if not ok:
+            ok, err = _safe_update(page_id, {"操作類型": {"select": {"name": act}}})
+        if not ok:
+            ok, err = _safe_update(page_id, {"操作類型": {"rich_text": [{"text": {"content": act}}]}})
 
-            # 操作結果（你的 DB 很可能是「status」，不是 select）
-            meta_r = (props_meta.get("操作結果") or {})
-            t_r = meta_r.get("type")
-            if t_r == "select":
-                props["操作結果"] = {"select": {"name": res_txt}}
-            elif t_r == "status":
-                props["操作結果"] = {"status": {"name": res_txt}}
-            else:
-                _best_set_text(props, props_meta, "操作結果", res_txt)
+        # 2-2) 操作內容：rich_text
+        _safe_update(page_id, {"操作內容": {"rich_text": [{"text": {"content": content}}]}})
 
-            # 操作時間（date / created_time）
-            meta_t = (props_meta.get("操作時間") or {})
-            if meta_t.get("type") == "date":
-                props["操作時間"] = {"date": {"start": now_iso}}
-            # created_time 不需要/不能手動寫，跳過
-        # schema 取不到 → 只寫 title（最安全，不讓 Notion 拒絕整筆寫入）
-
-        notion.pages.create(parent={"database_id": OPLOG_DB_ID}, properties=props)
+        # 2-3) 操作結果：先試 status，再試 select，再試 rich_text
+        ok, err = _safe_update(page_id, {"操作結果": {"status": {"name": res_txt}}})
+        if not ok:
+            ok, err = _safe_update(page_id, {"操作結果": {"select": {"name": res_txt}}})
+        if not ok:
+            _safe_update(page_id, {"操作結果": {"rich_text": [{"text": {"content": res_txt}}]}})
 
     except Exception as e:
-        if os.getenv("DEBUG_NOTION", "").strip() == "1":
+        if str(os.getenv("DEBUG_NOTION", "")).strip() == "1":
             st.error(f"❌ 寫入操作記錄失敗：{e}")
         return
 
