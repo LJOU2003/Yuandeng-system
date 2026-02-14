@@ -149,13 +149,13 @@ def _get_prop_plain_text(prop: dict) -> str:
     """更通用的 Notion 文字讀取：支援 title / rich_text / select / multi_select / number / checkbox."""
     if not prop:
         return ""
-    # title / rich_text
+    # title / rich_text（可能會被切成多段，這裡要把所有段落串起來，否則像 bcrypt hash 會被截斷）
     if "title" in prop:
         arr = prop.get("title") or []
-        return (arr[0].get("plain_text") or "").strip() if arr else ""
+        return "".join([(x.get("plain_text") or "") for x in arr]).strip() if arr else ""
     if "rich_text" in prop:
         arr = prop.get("rich_text") or []
-        return (arr[0].get("plain_text") or "").strip() if arr else ""
+        return "".join([(x.get("plain_text") or "") for x in arr]).strip() if arr else ""
     # select / multi_select
     if "select" in prop and prop.get("select"):
         return (prop["select"].get("name") or "").strip()
@@ -167,7 +167,8 @@ def _get_prop_plain_text(prop: dict) -> str:
         return str(prop.get("number"))
     if "checkbox" in prop and prop.get("checkbox") is not None:
         return "True" if prop.get("checkbox") else "False"
-    return ""
+    return 
+
 
 def _build_notion_prop_value(db_id: str, props_meta: dict, prop_name: str, value):
     """依據資料庫欄位型態，自動組出 Notion API properties payload；不匹配就回傳 None（略過該欄位）。"""
@@ -2062,7 +2063,8 @@ def log_action(employee_name: str, action_type: str, action_content: str, result
     """寫入「操作記錄表」：不強制欄位型態，盡力填入可用欄位。
     ✅ 重點：
     - 盡力寫入 title 欄位（Notion DB 必有），避免出現「空白列」
-    - 如果抓不到 schema，也會用常見欄位名稱做 fallback 寫入（至少要留下一筆可追蹤紀錄）
+    - 依據 Notion schema 自動套用正確型態（特別是：status vs select），避免整筆寫入被拒絕
+    - 如果抓不到 schema，就只寫 title（最安全，至少不會 0 記錄）
     """
     if not OPLOG_DB_ID:
         return
@@ -2077,48 +2079,52 @@ def log_action(employee_name: str, action_type: str, action_content: str, result
         props: dict = {}
 
         # 1) title 欄位（schema 有→找出 title 名稱；沒有→預設用「員工姓名」當 title）
-        title_prop = _first_title_prop_name(props_meta) or "員工姓名" or "員工姓名"
+        title_prop = _first_title_prop_name(props_meta) or "員工姓名"
         title_value = emp or act or "—"
         props[title_prop] = {"title": [{"text": {"content": title_value}}]}
 
         now_iso = datetime.now().isoformat()
 
         if props_meta:
-            # 2) schema 存在：用既有 helper 盡力寫入
+            # 員工姓名
             _best_set_text(props, props_meta, "員工姓名", emp)
-            _best_set_text(props, props_meta, "操作類型", act)
+
+            # 操作類型（可能是 select / status / rich_text）
+            meta_a = (props_meta.get("操作類型") or {})
+            t_a = meta_a.get("type")
+            if t_a == "select":
+                props["操作類型"] = {"select": {"name": act}}
+            elif t_a == "status":
+                props["操作類型"] = {"status": {"name": act}}
+            else:
+                _best_set_text(props, props_meta, "操作類型", act)
+
+            # 操作內容
             _best_set_text(props, props_meta, "操作內容", content)
 
-            # 操作結果（常見：select）
+            # 操作結果（你的 DB 很可能是「status」，不是 select）
             meta_r = (props_meta.get("操作結果") or {})
-            if meta_r.get("type") == "select" and res_txt:
+            t_r = meta_r.get("type")
+            if t_r == "select":
                 props["操作結果"] = {"select": {"name": res_txt}}
+            elif t_r == "status":
+                props["操作結果"] = {"status": {"name": res_txt}}
             else:
                 _best_set_text(props, props_meta, "操作結果", res_txt)
 
-            # 操作時間（常見：date）
+            # 操作時間（date / created_time）
             meta_t = (props_meta.get("操作時間") or {})
             if meta_t.get("type") == "date":
                 props["操作時間"] = {"date": {"start": now_iso}}
-        else:
-            # 3) schema 取不到：用「常見欄位名稱」直接寫入（盡量不要再產生空白列）
-            #    這些欄位若不存在或型態不同，Notion 會拒絕；因此這裡用 try/catch 包住
-            try:
-                props.setdefault("操作類型", {"rich_text": [{"text": {"content": act}}]})
-                props.setdefault("操作內容", {"rich_text": [{"text": {"content": content}}]})
-                # 操作結果常見是 select；若 DB 不是 select 會報錯，但至少 title 仍在
-                props.setdefault("操作結果", {"select": {"name": res_txt}})
-                props.setdefault("操作時間", {"date": {"start": now_iso}})
-            except Exception:
-                pass
+            # created_time 不需要/不能手動寫，跳過
+        # schema 取不到 → 只寫 title（最安全，不讓 Notion 拒絕整筆寫入）
 
-        notion.pages.create(database_id=OPLOG_DB_ID, properties=props)
+        notion.pages.create(parent={"database_id": OPLOG_DB_ID}, properties=props)
 
     except Exception as e:
         if os.getenv("DEBUG_NOTION", "").strip() == "1":
             st.error(f"❌ 寫入操作記錄失敗：{e}")
         return
-
 
 
 def list_operation_logs(limit: int = 200):
