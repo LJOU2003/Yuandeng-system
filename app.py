@@ -97,6 +97,63 @@ if not SALARY_DB_ID:
 notion = Client(auth=NOTION_TOKEN)
 
 # =========================
+# 🛠 部署端 Debug（可在「尚未登入」時使用）
+# 開啟方式：
+# 1) 網址加 ?debug=1
+# 2) Secrets / 環境變數：DEPLOY_DEBUG=1
+# 3) 登入頁面的「🛠 部署 Debug」展開後勾選
+# =========================
+def _get_query_param(name: str) -> str | None:
+    try:
+        # Streamlit >= 1.30
+        qp = getattr(st, "query_params", None)
+        if qp is not None:
+            v = qp.get(name)
+            if isinstance(v, list):
+                return v[0] if v else None
+            return v
+    except Exception:
+        pass
+    try:
+        qp = st.experimental_get_query_params()
+        v = qp.get(name)
+        if isinstance(v, list):
+            return v[0] if v else None
+        return v
+    except Exception:
+        return None
+
+def is_deploy_debug_enabled() -> bool:
+    # UI toggle（存在 session_state 就以它為主）
+    if "__deploy_debug" in st.session_state:
+        return bool(st.session_state.get("__deploy_debug"))
+    # URL
+    v = _get_query_param("debug")
+    if v is not None and str(v).strip() in ("1", "true", "True", "YES", "yes"):
+        return True
+    # Secrets / Env
+    v2 = _get_cfg("DEPLOY_DEBUG") or _get_cfg("DEBUG_NOTION") or os.getenv("DEPLOY_DEBUG") or os.getenv("DEBUG_NOTION")
+    if v2 is not None and str(v2).strip() in ("1", "true", "True", "YES", "yes"):
+        return True
+    return False
+
+def _mask(s: str, head: int = 10, tail: int = 6) -> str:
+    s = s or ""
+    if len(s) <= head + tail:
+        return s
+    return f"{s[:head]}...{s[-tail:]}"
+
+def deploy_debug_note(msg: str):
+    # 同時印到 logs 與畫面（畫面只有在 debug 開啟時顯示）
+    try:
+        print(f"[DEPLOY_DEBUG] {msg}")
+    except Exception:
+        pass
+    if is_deploy_debug_enabled():
+        st.caption(f"🛠 {msg}")
+
+
+# =========================
 # ✅ 表格欄位清理（員工視角不顯示建立/更新時間）
 # =========================
 META_COLUMNS = {"建立時間", "最後更新時間"}
@@ -2303,6 +2360,10 @@ def login(username: str, password: str):
     username = (username or "").strip()
     password = (password or "").strip()
 
+    # Debug：每次嘗試登入先清空上一次資訊
+    if is_deploy_debug_enabled():
+        st.session_state["__debug_login"] = {}
+
     if not username or not password:
         log_action(username or "—", "登入", "帳號或密碼為空", "失敗")
         return False, False, False
@@ -2320,9 +2381,27 @@ def login(username: str, password: str):
         role = sel.get("name") if sel else None
         is_admin = (role == "管理員")
 
+        if is_deploy_debug_enabled():
+            st.session_state["__debug_login"].update({
+                "username": username,
+                "found_page": True,
+                "role": role,
+                "is_admin": is_admin,
+            })
+
         login_hash = _get_prop_plain_text(props.get("login_hash", {}))
         legacy_pwd = _get_prop_plain_text(props.get("密碼", {}))
         must_change_flag = bool((props.get("must_change_password", {}) or {}).get("checkbox") or False)
+
+        if is_deploy_debug_enabled():
+            st.session_state["__debug_login"].update({
+                "has_login_hash": bool(login_hash),
+                "login_hash_len": len(login_hash) if login_hash else 0,
+                "login_hash_mask": _mask(login_hash, 12, 8) if login_hash else "",
+                "has_legacy_pwd": bool(legacy_pwd),
+                "legacy_pwd_len": len(legacy_pwd) if legacy_pwd else 0,
+                "must_change_flag": must_change_flag,
+            })
 
         used_legacy = False
 
@@ -2331,6 +2410,13 @@ def login(username: str, password: str):
         else:
             ok = (password == legacy_pwd)
             used_legacy = bool(ok)
+
+        if is_deploy_debug_enabled():
+            st.session_state["__debug_login"].update({
+                "used_legacy": used_legacy,
+                "bcrypt_ok": bool(ok) if login_hash else None,
+                "legacy_ok": bool(ok) if (not login_hash) else None,
+            })
 
         if not ok:
             log_action(username, "登入", "帳號或密碼錯誤", "失敗")
@@ -4389,6 +4475,15 @@ if not st.session_state["logged_in"]:
     # ✅ 版面置中（不影響其他頁）
     pad1, center, pad2 = st.columns([1, 1.2, 1])
     with center:
+        # 🛠 部署 Debug：尚未登入也能開啟
+        with st.expander("🛠 部署 Debug（尚未登入也可用）", expanded=is_deploy_debug_enabled()):
+            _ui_default = is_deploy_debug_enabled()
+            st.session_state["__deploy_debug"] = st.checkbox("開啟 Debug", value=_ui_default, key="__deploy_debug_cb")
+            if st.session_state.get("__debug_login"):
+                st.write("🔎 Debug / login()")
+                st.json(st.session_state.get("__debug_login"))
+            st.caption("開啟方式：?debug=1 或 Secrets/Env：DEPLOY_DEBUG=1")
+
         # ✅ 把登入區改成 st.form：外框就是表單容器，所以「一定會被包在卡片裡」
         with st.form("login_form", clear_on_submit=False):
             st.markdown('<div class="login-icon"><span>🔐</span></div>', unsafe_allow_html=True)
