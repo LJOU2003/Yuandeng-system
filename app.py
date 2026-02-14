@@ -61,7 +61,7 @@ ACCOUNT_DB_ID = _get_cfg("ACCOUNT_DB_ID")
 LEAVE_DB_ID = _get_cfg("LEAVE_DB_ID")
 VACATION_DB_ID = _get_cfg("VACATION_DB_ID")
 SALARY_DB_ID = _get_cfg("SALARY_DB_ID")  # ✅ 薪資計算表
-OPLOG_DB_ID = _get_cfg("OPLOG_DB_ID")    # ✅ 操作記錄表
+OPLOG_DB_ID = _get_cfg("OPLOG_DB_ID") or _get_cfg("OP_LOG_DB_ID") or _get_cfg("OPERATION_LOG_DB_ID")  # ✅ 操作記錄表
 CASHOUT_RULE_DB_ID = _get_cfg("CASHOUT_RULE_DB_ID")
 ANNOUNCE_DB_ID = _get_cfg("ANNOUNCE_DB_ID")  # ✅ 公告紀錄表
 PUNCH_DB_ID = _get_cfg("PUNCH_DB_ID")
@@ -241,7 +241,10 @@ def verify_password_bcrypt(plain: str, hashed: str) -> bool:
     if not plain or not hashed:
         return False
     try:
-        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+        # ✅ Notion 的 rich_text / title 有時會把長字串切段或夾雜換行、空白
+        #    雲端部署時最常見的就是 login_hash 讀出來含有 \n / 空白，導致 bcrypt 驗證永遠失敗
+        cleaned = re.sub(r"\s+", "", str(hashed))
+        return bcrypt.checkpw(plain.encode("utf-8"), cleaned.encode("utf-8"))
     except Exception:
         return False
 
@@ -2074,7 +2077,7 @@ def log_action(employee_name: str, action_type: str, action_content: str, result
         props: dict = {}
 
         # 1) title 欄位（schema 有→找出 title 名稱；沒有→預設用「員工姓名」當 title）
-        title_prop = _first_title_prop_name(props_meta) or "員工姓名"
+        title_prop = _first_title_prop_name(props_meta) or "員工姓名" or "員工姓名"
         title_value = emp or act or "—"
         props[title_prop] = {"title": [{"text": {"content": title_value}}]}
 
