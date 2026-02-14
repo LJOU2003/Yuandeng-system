@@ -2429,7 +2429,7 @@ def login(username: str, password: str):
 
     if not username or not password:
         if is_deploy_debug_enabled():
-            st.session_state[\"__debug_login\"].update({\"stage\": \"empty_credentials\", \"probe\": _debug_notion_account_probe(username)})
+            st.session_state["__debug_login"].update({\"stage\": \"empty_credentials\", \"probe\": _debug_notion_account_probe(username)})
         log_action(username or \"—\", \"登入\", \"帳號或密碼為空\", \"失敗\")
         return False, False, False
 
@@ -2437,7 +2437,7 @@ def login(username: str, password: str):
         page = get_account_page_by_username(username)
         if not page:
             if is_deploy_debug_enabled():
-                st.session_state[\"__debug_login\"].update({\"stage\": \"account_not_found\", \"probe\": _debug_notion_account_probe(username)})
+                st.session_state["__debug_login"].update({\"stage\": \"account_not_found\", \"probe\": _debug_notion_account_probe(username)})
             log_action(username, \"登入\", \"找不到帳號\", \"失敗\")
             return False, False, False
 
@@ -2487,7 +2487,7 @@ def login(username: str, password: str):
 
         if not ok:
             if is_deploy_debug_enabled():
-                st.session_state[\"__debug_login\"].update({\"stage\": \"verify_failed\", \"probe\": _debug_notion_account_probe(username)})
+                st.session_state["__debug_login"].update({\"stage\": \"verify_failed\", \"probe\": _debug_notion_account_probe(username)})
             log_action(username, \"登入\", \"帳號或密碼錯誤\", \"失敗\")
             return False, False, False
 
