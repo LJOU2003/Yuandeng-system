@@ -3988,10 +3988,66 @@ st.markdown(
         font-weight: 700;
         font-size: 16px;
     }
-    </style>
+    
+
+    /* ----- Footer bar ----- */
+    .block-container{ padding-bottom: 78px !important; } /* avoid content hidden behind fixed footer */
+    .app-footer{
+        position: fixed;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        height: 28px;
+        background: #0b2b5b;
+        color: #ffffff;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 12px;
+        line-height: 1;
+        padding: 0 10px;
+        font-weight: 400;
+        letter-spacing: 0.3px;
+        z-index: 500;
+        box-shadow: 0 -10px 26px rgba(0, 35, 60, 0.18);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;        
+    }
+
+    /* ----- Mobile (RWD) tweaks ----- */
+    @media (max-width: 768px){
+        section.main > div{ padding-top: 0.8rem !important; padding-left: 0.8rem !important; padding-right: 0.8rem !important; }
+        .welcome-card{ padding: 18px 18px !important; }
+        .welcome-title{ font-size: 22px !important; }
+        .metric-box{ min-width: 100% !important; }
+        .announce-box{ height: auto !important; }
+        .announce-body{ height: auto !important; max-height: 420px; }
+        div[data-testid="stForm"]{ padding: 26px 18px 20px 18px !important; border-radius: 22px !important; }
+        div[data-testid="stForm"] .login-title{ font-size: 22px !important; }
+        .app-footer{
+            height: 26px;
+            font-size: 10.5px;
+            letter-spacing: 0.2px;
+            padding: 0 8px;
+        .app-footer p, .app-footer div, .app-footer span{
+            margin: 0 !important;
+            padding: 0 !important;
+            line-height: 1 !important;    
+    }
+</style>
     """,
     unsafe_allow_html=True,
 )
+
+def render_footer():
+    # ✅ 全頁面固定底部深藍色版權條（含登入頁）
+    st.markdown(
+        '<div class="app-footer">元廣順汽車有限公司內部系統｜Copyright © 2026 By LJOU</div>',
+        unsafe_allow_html=True,
+    )
+
+
 
 if "logged_in" not in st.session_state:
     st.session_state["logged_in"] = False
@@ -4009,6 +4065,7 @@ if "cashout_whole_days_only" not in st.session_state:
 if st.session_state.get("logged_in", False) and st.session_state.get("force_change_pwd", False):
     st.warning("⚠️ 你目前是用明碼登入或被重設密碼，請先更改密碼。")
     change_password_dialog(force=True)
+    render_footer()
     st.stop()
 
 
@@ -5880,3 +5937,8 @@ else:
 
         else:
             st.write("（建置中...）")
+
+# =========================
+# ✅ Global footer
+# =========================
+render_footer()
