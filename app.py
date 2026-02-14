@@ -137,6 +137,69 @@ def is_deploy_debug_enabled() -> bool:
         return True
     return False
 
+
+def _dbg_safe_id(s: str, head: int = 6, tail: int = 4) -> str:
+    """Mask IDs/secrets for debug display."""
+    s = str(s or "")
+    if not s:
+        return ""
+    if len(s) <= head + tail:
+        return s
+    return f"{s[:head]}...{s[-tail:]}"
+
+
+def _debug_notion_account_probe(username: str) -> dict:
+    """Probe ACCOUNT_DB schema and the user's row (safe, masked) for deploy debugging."""
+    out: dict = {
+        "ACCOUNT_DB_ID": _dbg_safe_id(ACCOUNT_DB_ID),
+        "LOG_DB_ID": _dbg_safe_id(LOG_DB_ID) if 'LOG_DB_ID' in globals() else "",
+        "username": (username or "").strip(),
+    }
+    try:
+        out["bcrypt_version"] = getattr(bcrypt, "__version__", "unknown")
+    except Exception:
+        out["bcrypt_version"] = "unknown"
+
+    # DB title + prop types
+    try:
+        db = notion.databases.retrieve(database_id=ACCOUNT_DB_ID)
+        out["account_db_title"] = "".join([(x.get("plain_text") or "") for x in (db.get("title") or [])]).strip()
+        props = (db.get("properties", {}) or {}) if isinstance(db, dict) else {}
+        out["account_db_props"] = {k: (v.get("type") if isinstance(v, dict) else None) for k, v in props.items()}
+    except Exception as e:
+        out["account_db_retrieve_error"] = str(e)
+
+    uname = out["username"]
+    if uname:
+        tries = []
+        for ftype, flt in [
+            ("title.equals", {"property": "員工姓名", "title": {"equals": uname}}),
+            ("rich_text.equals", {"property": "員工姓名", "rich_text": {"equals": uname}}),
+        ]:
+            try:
+                res = notion.databases.query(database_id=ACCOUNT_DB_ID, filter=flt, page_size=5)
+                rows = res.get("results", []) if isinstance(res, dict) else []
+                item = {"filter": ftype, "count": len(rows), "page_id": _dbg_safe_id(rows[0].get("id")) if rows else ""}
+                if rows:
+                    p = (rows[0].get("properties", {}) or {})
+                    lh = _get_prop_plain_text(p.get("login_hash", {}))
+                    lp = _get_prop_plain_text(p.get("密碼", {}))
+                    item.update({
+                        "has_login_hash": bool(lh),
+                        "login_hash_len": len(lh) if lh else 0,
+                        "login_hash_prefix": (re.sub(r"\s+", "", lh)[:12] if lh else ""),
+                        "has_legacy_pwd": bool(lp),
+                        "legacy_pwd_len": len(lp) if lp else 0,
+                        "role": ((p.get("權限", {}) or {}).get("select") or {}).get("name"),
+                    })
+                tries.append(item)
+            except Exception as e:
+                tries.append({"filter": ftype, "error": str(e)})
+        out["account_query"] = tries
+
+    return out
+
+
 def _mask(s: str, head: int = 10, tail: int = 6) -> str:
     s = s or ""
     if len(s) <= head + tail:
@@ -2365,13 +2428,17 @@ def login(username: str, password: str):
         st.session_state["__debug_login"] = {}
 
     if not username or not password:
-        log_action(username or "—", "登入", "帳號或密碼為空", "失敗")
+        if is_deploy_debug_enabled():
+            st.session_state[\"__debug_login\"].update({\"stage\": \"empty_credentials\", \"probe\": _debug_notion_account_probe(username)})
+        log_action(username or \"—\", \"登入\", \"帳號或密碼為空\", \"失敗\")
         return False, False, False
 
     try:
         page = get_account_page_by_username(username)
         if not page:
-            log_action(username, "登入", "找不到帳號", "失敗")
+            if is_deploy_debug_enabled():
+                st.session_state[\"__debug_login\"].update({\"stage\": \"account_not_found\", \"probe\": _debug_notion_account_probe(username)})
+            log_action(username, \"登入\", \"找不到帳號\", \"失敗\")
             return False, False, False
 
         page_id = page["id"]
@@ -2419,7 +2486,9 @@ def login(username: str, password: str):
             })
 
         if not ok:
-            log_action(username, "登入", "帳號或密碼錯誤", "失敗")
+            if is_deploy_debug_enabled():
+                st.session_state[\"__debug_login\"].update({\"stage\": \"verify_failed\", \"probe\": _debug_notion_account_probe(username)})
+            log_action(username, \"登入\", \"帳號或密碼錯誤\", \"失敗\")
             return False, False, False
 
         try:
