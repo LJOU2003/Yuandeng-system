@@ -97,6 +97,43 @@ if not SALARY_DB_ID:
 notion = Client(auth=NOTION_TOKEN)
 
 # =========================
+# 🔧 Notion `databases.query` 相容修復
+# 有些部署環境會出現 `DatabasesEndpoint` 沒有 `query` 方法，導致「查無帳號」
+# 這裡提供 fallback：直接用 Notion REST API 呼叫 /databases/{db_id}/query
+# =========================
+
+def _notion_rest_db_query(database_id: str, payload: dict) -> dict:
+    import requests
+
+    token = NOTION_TOKEN
+    if not token:
+        raise RuntimeError("❌ NOTION_TOKEN 未設定，無法查詢 Notion Database")
+
+    notion_version = os.getenv("NOTION_VERSION", "2022-06-28")
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Notion-Version": notion_version,
+        "Content-Type": "application/json",
+    }
+    url = f"https://api.notion.com/v1/databases/{database_id}/query"
+    resp = requests.post(url, headers=headers, json=payload, timeout=20)
+    resp.raise_for_status()
+    return resp.json()
+
+# 若 notion.databases.query 不存在，動態補上
+if not hasattr(notion.databases, "query"):
+    def _compat_databases_query(*, database_id: str, **kwargs):
+        payload = dict(kwargs) if kwargs else {}
+        return _notion_rest_db_query(database_id, payload)
+
+    try:
+        setattr(notion.databases, "query", _compat_databases_query)
+    except Exception:
+        # 若無法 setattr，就維持原狀；後續會在 debug 中顯示錯誤
+        pass
+
+
+# =========================
 # 🛠 部署端 Debug（可在「尚未登入」時使用）
 # 開啟方式：
 # 1) 網址加 ?debug=1
