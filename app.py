@@ -3765,32 +3765,49 @@ def upsert_attendance_record(employee_name: str, attend_date: date, status: str,
         return False
 
     try:
-        props_meta = get_db_properties(ATTEND_DB_ID)
-
-        def has_prop(n: str) -> bool:
-            return n in (props_meta or {})
-
-        # 驗證狀態選項
-        options = get_select_options(ATTEND_DB_ID, "出勤狀態") or [ATTEND_PRESENT_STATUS, ATTEND_LEAVE_STATUS, ATTEND_LATE_STATUS]
-        if status not in options:
+        # 驗證狀態選項（若取不到 options，仍允許寫入；讓 Notion 端決定是否擋下）
+        options = get_select_options(ATTEND_DB_ID, "出勤狀態") or [
+            ATTEND_PRESENT_STATUS, ATTEND_LEAVE_STATUS, ATTEND_LATE_STATUS
+        ]
+        if options and (status not in options):
             st.error(f"❌ 出勤狀態 Notion 選項不存在：{status}（請先在 Notion 建立選項）")
             return False
 
         page_id = find_attendance_page(employee_name, attend_date)
 
-        props = {}
-        if has_prop("員工姓名") and (not page_id):
-            props["員工姓名"] = {"title": [{"text": {"content": employee_name}}]}
-        if has_prop("出勤日期"):
-            props["出勤日期"] = {"date": {"start": datetime.combine(attend_date, datetime.min.time()).isoformat()}}
-        if has_prop("出勤狀態"):
-            props["出勤狀態"] = {"select": {"name": status}}
+        attend_iso = datetime.combine(attend_date, datetime.min.time()).isoformat()
+
+        # 不依賴 database properties schema（部署端曾出現 retrieve 失敗導致 props_meta={}，進而寫出空白列）
+        # 直接用既定欄位名嘗試寫入，若 Notion 回報型別不符，再用 fallback 型別重試。
+        base_props = {
+            "員工姓名": {"title": [{"text": {"content": employee_name}}]},
+            "出勤日期": {"date": {"start": attend_iso}},
+            "出勤狀態": {"select": {"name": status}},
+        }
+
+        def _try_write(props: dict) -> None:
+            if page_id:
+                notion.pages.update(page_id=page_id, properties=props)
+            else:
+                notion.pages.create(parent={"database_id": ATTEND_DB_ID}, properties=props)
+
+        try:
+            _try_write(base_props)
+        except Exception as e1:
+            # 1) 員工姓名：若不是 title（例如 rich_text），改用 rich_text
+            props2 = dict(base_props)
+            props2["員工姓名"] = {"rich_text": [{"text": {"content": employee_name}}]}
+            try:
+                _try_write(props2)
+            except Exception as e2:
+                # 2) 出勤狀態：可能是 status 類型（Notion 新屬性），改用 status
+                props3 = dict(props2)
+                props3["出勤狀態"] = {"status": {"name": status}}
+                _try_write(props3)
 
         if page_id:
-            notion.pages.update(page_id=page_id, properties=props)
             log_action(actor or "—", "出勤更新", f"{employee_name}｜{attend_date.isoformat()}｜{status}", "成功")
         else:
-            notion.pages.create(parent={"database_id": ATTEND_DB_ID}, properties=props)
             log_action(actor or "—", "出勤新增", f"{employee_name}｜{attend_date.isoformat()}｜{status}", "成功")
 
         return True
