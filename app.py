@@ -273,6 +273,61 @@ def get_select_options(database_id: str, property_name: str) -> list[str]:
         return []
 
 
+def _first_title_prop_name(props_meta: dict) -> str | None:
+    """回傳資料庫中第一個 title 欄位名稱（Notion 每個 DB 一定會有一個 title）。"""
+    for name, meta in (props_meta or {}).items():
+        if (meta or {}).get("type") == "title":
+            return name
+    return None
+
+
+def _build_text_property_by_type(prop_type: str, value: str):
+    """依 Notion property type 產生正確 payload（只處理文字相關）。"""
+    v = (value or "").strip()
+    if prop_type == "title":
+        return {"title": [{"text": {"content": v}}]} if v else {"title": []}
+    if prop_type == "rich_text":
+        return {"rich_text": [{"text": {"content": v}}]} if v else {"rich_text": []}
+    # 其他型態不支援 → 回 None
+    return None
+
+
+def _best_set_text(props: dict, props_meta: dict, prop_name: str, value: str) -> None:
+    """如果欄位存在且是 title/rich_text，盡力寫入；否則忽略。"""
+    meta = (props_meta or {}).get(prop_name)
+    if not meta:
+        return
+    payload = _build_text_property_by_type((meta or {}).get("type"), value)
+    if payload is not None:
+        props[prop_name] = payload
+
+
+def _best_set_select(props: dict, props_meta: dict, db_id: str, prop_name: str, value: str) -> None:
+    meta = (props_meta or {}).get(prop_name)
+    if not meta or (meta.get("type") != "select"):
+        return
+    v = (value or "").strip()
+    if not v:
+        return
+    options = get_select_options(db_id, prop_name) or []
+    if (not options) or (v in options):
+        props[prop_name] = {"select": {"name": v}}
+
+
+def _equals_filter_by_type(props_meta: dict, prop_name: str, value: str) -> dict | None:
+    """依欄位型態產生 Notion filter（title/rich_text）。"""
+    meta = (props_meta or {}).get(prop_name) or {}
+    t = meta.get("type")
+    v = (value or "").strip()
+    if not v:
+        return None
+    if t == "title":
+        return {"property": prop_name, "title": {"equals": v}}
+    if t == "rich_text":
+        return {"property": prop_name, "rich_text": {"equals": v}}
+    return None
+
+
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """回傳兩點距離（公尺）"""
     R = 6371000.0
@@ -480,11 +535,16 @@ def list_punch_records(employee_name: str, y: int, m: int, limit: int = 500) -> 
         rows = []
         next_cursor = None
 
+        props_meta = get_db_properties(PUNCH_DB_ID) or {}
+        name_filter = _equals_filter_by_type(props_meta, "員工姓名", employee_name)
+        if not name_filter:
+            return []
+
         base_query = {
             "database_id": PUNCH_DB_ID,
             "filter": {
                 "and": [
-                    {"property": "員工姓名", "title": {"equals": employee_name}},
+                    name_filter,
                     {"property": "打卡時間", "date": {"on_or_after": datetime.combine(start_d, datetime.min.time()).isoformat()}},
                     {"property": "打卡時間", "date": {"before": datetime.combine(end_d, datetime.min.time()).isoformat()}},
                 ]
@@ -564,30 +624,43 @@ def sanitize_announce_text(s: str) -> str:
 
 
 def list_employee_names(limit: int = 200) -> list[str]:
-    """從員工資料表抓出所有員工姓名（title 欄位：員工姓名）"""
+    """從帳號管理表抓出所有員工姓名（自動適配 title / rich_text）。"""
     try:
         if not ACCOUNT_DB_ID:
             return []
-        props = get_db_properties(ACCOUNT_DB_ID) or {}
-        if "員工姓名" not in props:
+
+        props_meta = get_db_properties(ACCOUNT_DB_ID) or {}
+        if "員工姓名" not in props_meta:
             return []
+
+        ptype = (props_meta.get("員工姓名", {}) or {}).get("type")
 
         res = notion.databases.query(
             database_id=ACCOUNT_DB_ID,
             page_size=min(limit, 100),
         )
 
-        names = []
+        names: list[str] = []
         for page in res.get("results", []):
             p = page.get("properties", {}) or {}
-            t = (p.get("員工姓名", {}) or {}).get("title", [])
-            name = t[0]["plain_text"].strip() if t else ""
+            cell = p.get("員工姓名", {}) or {}
+
+            if ptype == "title":
+                t = cell.get("title", []) or []
+                name = (t[0].get("plain_text") or "").strip() if t else ""
+            elif ptype == "rich_text":
+                name = _rt_get_first_plain_text(cell)
+            else:
+                name = ""
+
             if name:
                 names.append(name)
 
         # 去重 + 排序
         names = sorted(list(dict.fromkeys(names)))
         return names
+    except Exception:
+        return []
     except Exception:
         return []
 
@@ -1951,7 +2024,11 @@ def resolve_salary_food_prop_name() -> str | None:
 # ✅ 操作記錄表：寫入 / 讀取
 # =========================
 def log_action(employee_name: str, action_type: str, action_content: str, result: str):
-    """寫入操作記錄（自動依 Notion 欄位型態組 payload；欄位不存在就略過，不會因型態不符整筆失敗）。"""
+    """寫入「操作記錄表」：不強制欄位型態，盡力填入可用欄位。
+    ✅ 重點：
+    - 永遠會寫入「title 欄位」（不管它叫什麼），避免雲端只出現空白列
+    - 其他欄位（員工姓名/操作類型/操作內容/操作結果/操作時間）依資料庫實際型態自動適配
+    """
     if not OPLOG_DB_ID:
         return
 
@@ -1962,32 +2039,29 @@ def log_action(employee_name: str, action_type: str, action_content: str, result
 
     try:
         props_meta = get_db_properties(OPLOG_DB_ID) or {}
-        props = {}
+        props: dict = {}
 
-        # 依欄位型態自動塞值（title/rich_text/select/date...）
-        for k, v in [
-            ("員工姓名", employee_name or "—"),
-            ("操作類型", action_type),
-            ("操作內容", action_content),
-            ("操作結果", result),
-        ]:
-            if k in props_meta:
-                pv = _build_notion_prop_value(OPLOG_DB_ID, props_meta, k, v)
-                if pv is not None:
-                    props[k] = pv
+        # 1) 一定要填 title 欄位（Notion DB 必有）
+        title_prop = _first_title_prop_name(props_meta)
+        if title_prop:
+            # 優先用員工姓名，沒有就用操作類型/內容當 title
+            title_value = employee_name or action_type or action_content or "—"
+            props[title_prop] = {"title": [{"text": {"content": str(title_value)}}]}
 
-        # 操作時間：若是 date 才寫入；若是 created_time/last_edited_time 則由 Notion 自動帶入
+        # 2) 其他欄位：依實際型態盡力寫入（不存在就略過）
+        _best_set_text(props, props_meta, "員工姓名", employee_name or "—")
+        _best_set_text(props, props_meta, "操作類型", action_type)
+        _best_set_text(props, props_meta, "操作內容", action_content)
+        _best_set_select(props, props_meta, OPLOG_DB_ID, "操作結果", result)
+
+        # 3) 操作時間：如果你的欄位是 date，才手動寫入；若是 created_time 則 Notion 會自動填
         if "操作時間" in props_meta:
-            tmeta = props_meta.get("操作時間", {}) or {}
-            if tmeta.get("type") == "date":
-                pv = _build_notion_prop_value(OPLOG_DB_ID, props_meta, "操作時間", datetime.now())
-                if pv is not None:
-                    props["操作時間"] = pv
+            p_type = (props_meta.get("操作時間", {}) or {}).get("type")
+            if p_type == "date":
+                props["操作時間"] = {"date": {"start": datetime.now().isoformat()}}
 
         notion.pages.create(parent={"database_id": OPLOG_DB_ID}, properties=props)
-
     except Exception:
-        # 操作記錄寫入失敗不影響主流程
         return
 
 
@@ -6013,18 +6087,6 @@ else:
                     st.success("✅ 已重設！員工下次登入會被強制更改密碼。")
                     st.info("⚠️ 規則：Notion 會只保留『密碼』，並清空『login_hash』，避免同時存在。")
                     st.rerun()
-                # ==============================
-                # 🔎 Cloud Debug Mode（對齊這裡）
-                # ==============================
-
-                st.markdown("---")
-                st.subheader("🛠 雲端除錯模式（管理員專用）")
-
-                debug_on = st.checkbox("啟用除錯模式")
-
-                if debug_on:
-                    st.write("ACCOUNT_DB_ID:", ACCOUNT_DB_ID)
-                    st.write("OPLOG_DB_ID:", OPLOG_DB_ID)
 
         else:
             st.write("（建置中...）")
