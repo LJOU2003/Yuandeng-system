@@ -20,14 +20,41 @@ import re
 load_dotenv()
 
 def _get_cfg(key: str, default=None):
-    """優先讀取 Streamlit Cloud 的 st.secrets，其次讀取環境變數；都沒有則回傳 default。"""
+    """優先讀取 Streamlit Cloud 的 st.secrets，其次讀取環境變數；都沒有則回傳 default。
+    ✅ 兼容：大小寫不同的 key（例如 secrets 用 notion_token / NOTION_TOKEN）
+    """
+    keys_to_try = [key, str(key).upper(), str(key).lower()]
+    # 1) Streamlit Secrets
     try:
-        if hasattr(st, "secrets") and key in st.secrets:
-            return st.secrets[key]
+        if hasattr(st, "secrets"):
+            for k in keys_to_try:
+                if k in st.secrets:
+                    return st.secrets[k]
+                # 有些人會放在 [general] 或其他 section 內（st.secrets 會是 dict-like）
+                try:
+                    v = st.secrets.get(k, None)  # type: ignore[attr-defined]
+                    if v is not None:
+                        return v
+                except Exception:
+                    pass
+            # 掃描一層巢狀（避免 secrets.toml 分段）
+            try:
+                for _, section in dict(st.secrets).items():
+                    if isinstance(section, dict):
+                        for k in keys_to_try:
+                            if k in section:
+                                return section[k]
+            except Exception:
+                pass
     except Exception:
         pass
-    v = os.getenv(key)
-    return v if v is not None else default
+
+    # 2) Environment Variables
+    for k in keys_to_try:
+        v = os.getenv(k)
+        if v is not None:
+            return v
+    return default
 
 NOTION_TOKEN = _get_cfg("NOTION_TOKEN")
 ACCOUNT_DB_ID = _get_cfg("ACCOUNT_DB_ID")
@@ -2039,10 +2066,16 @@ def log_action(employee_name: str, action_type: str, action_content: str, result
 
     try:
         props_meta = get_db_properties(OPLOG_DB_ID) or {}
+        if not props_meta:
+            # ✅ 取不到 schema（多半是雲端 secrets / token / 權限問題）時，不要寫入，避免產生空白列
+            return
         props: dict = {}
 
         # 1) 一定要填 title 欄位（Notion DB 必有）
         title_prop = _first_title_prop_name(props_meta)
+        if not title_prop:
+            # ✅ 找不到 title 欄位名稱就不要寫入，避免雲端生成空白列
+            return
         if title_prop:
             # 優先用員工姓名，沒有就用操作類型/內容當 title
             title_value = employee_name or action_type or action_content or "—"
