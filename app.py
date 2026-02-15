@@ -461,9 +461,26 @@ def _normalize_notion_id(raw: str | None) -> str | None:
     return f"{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
 
 @st.cache_data(ttl=60)
-def get_db_properties(database_id: str) -> dict:
+def get_db_properties(database_id: str, force_refresh: bool = False, **_kwargs) -> dict:
+    """取得 Notion DB 的 properties。
+
+    你的流程會呼叫 get_db_properties(db_id, force_refresh=True) 來強制重抓欄位。
+    本函式原本沒有 force_refresh 參數會直接報錯：
+        get_db_properties() got an unexpected keyword argument 'force_refresh'
+
+    這裡修正為：
+    1) force_refresh=True 時清除 st.cache_data 快取
+    2) 把 DB ID 統一正規化（支援 32 碼、帶 dash、或整段網址）
+    """
     try:
-        db = notion.databases.retrieve(database_id=database_id)
+        if force_refresh:
+            try:
+                get_db_properties.clear()
+            except Exception:
+                pass
+
+        dbid = _normalize_notion_id(database_id) or database_id
+        db = notion.databases.retrieve(database_id=dbid)
         return db.get("properties", {}) or {}
     except Exception as e:
         # ✅ 佈署到 Streamlit Cloud 時，如果 secrets/token/權限或 DB_ID 有問題，這裡會失敗
