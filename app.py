@@ -96,6 +96,29 @@ if not SALARY_DB_ID:
 
 notion = Client(auth=NOTION_TOKEN)
 
+
+# =========================
+# 🔧 Notion Database ID 正規化
+# - 支援：32 碼 hex（無連字號）、UUID（有連字號）、以及 notion.so/<id>?v=... 連結
+# - 避免部署端出現 404（其實是 ID 格式不被接受）導致抓不到 properties / query
+# =========================
+def _normalize_notion_db_id(raw: str) -> str:
+    if not raw:
+        return raw
+    s = str(raw).strip()
+
+    # 如果使用者不小心貼了整段 URL，就把 id 擷取出來
+    m = re.search(r"([0-9a-fA-F]{32})", s)
+    if m:
+        s = m.group(1)
+
+    # 32 碼轉成 UUID（8-4-4-4-12）
+    if re.fullmatch(r"[0-9a-fA-F]{32}", s):
+        s = f"{s[0:8]}-{s[8:12]}-{s[12:16]}-{s[16:20]}-{s[20:32]}"
+
+    return s
+
+
 # =========================
 # 🔧 Notion `databases.query` 相容修復
 # 有些部署環境會出現 `DatabasesEndpoint` 沒有 `query` 方法，導致「查無帳號」
@@ -115,6 +138,7 @@ def _notion_rest_db_query(database_id: str, payload: dict) -> dict:
         "Notion-Version": notion_version,
         "Content-Type": "application/json",
     }
+    database_id = _normalize_notion_db_id(database_id)
     url = f"https://api.notion.com/v1/databases/{database_id}/query"
     resp = requests.post(url, headers=headers, json=payload, timeout=20)
     resp.raise_for_status()
@@ -124,7 +148,7 @@ def _notion_rest_db_query(database_id: str, payload: dict) -> dict:
 if not hasattr(notion.databases, "query"):
     def _compat_databases_query(*, database_id: str, **kwargs):
         payload = dict(kwargs) if kwargs else {}
-        return _notion_rest_db_query(database_id, payload)
+        return _notion_rest_db_query(_normalize_notion_db_id(database_id), payload)
 
     try:
         setattr(notion.databases, "query", _compat_databases_query)
@@ -199,7 +223,7 @@ def _debug_notion_account_probe(username: str) -> dict:
 
     # DB title + prop types
     try:
-        db = notion.databases.retrieve(database_id=ACCOUNT_DB_ID)
+        db = notion.databases.retrieve(database_id=_normalize_notion_db_id(ACCOUNT_DB_ID))
         out["account_db_title"] = "".join([(x.get("plain_text") or "") for x in (db.get("title") or [])]).strip()
         props = (db.get("properties", {}) or {}) if isinstance(db, dict) else {}
         out["account_db_props"] = {k: (v.get("type") if isinstance(v, dict) else None) for k, v in props.items()}
@@ -214,7 +238,7 @@ def _debug_notion_account_probe(username: str) -> dict:
             ("rich_text.equals", {"property": "員工姓名", "rich_text": {"equals": uname}}),
         ]:
             try:
-                res = notion.databases.query(database_id=ACCOUNT_DB_ID, filter=flt, page_size=5)
+                res = notion.databases.query(database_id=_normalize_notion_db_id(ACCOUNT_DB_ID), filter=flt, page_size=5)
                 rows = res.get("results", []) if isinstance(res, dict) else []
                 item = {"filter": ftype, "count": len(rows), "page_id": _dbg_safe_id(rows[0].get("id")) if rows else ""}
                 if rows:
@@ -441,7 +465,7 @@ def get_account_page_by_username(username: str) -> dict | None:
 @st.cache_data(ttl=60)
 def get_db_properties(database_id: str) -> dict:
     try:
-        db = notion.databases.retrieve(database_id=database_id)
+        db = notion.databases.retrieve(database_id=_normalize_notion_db_id(database_id))
         return db.get("properties", {}) or {}
     except Exception as e:
         # ✅ 佈署到 Streamlit Cloud 時，如果 secrets/token/權限或 DB_ID 有問題，這裡會失敗
@@ -1401,7 +1425,7 @@ def render_duty_schedule_page():
                 mm = st.number_input("月份", min_value=1, max_value=12, value=int(st.session_state.get("duty_m", datetime.now().month)), step=1, key="ot_rule_m")
 
                 st.caption("名稱會自動產生（YYYY-MM）")
-                st.text_input("名稱", value=f"{int(yy)}-{int(mm):02d}", disabled=True, key="ot_rule_name")
+                st.text_input("紀錄", value=f"{int(yy)}-{int(mm):02d}", disabled=True, key="ot_rule_name")
 
                 c1, c2 = st.columns(2)
                 with c1:
@@ -1690,7 +1714,7 @@ def get_overtime_count_hours(employee: str, y: int, m: int) -> float:
                 {"property": k_emp, "title": {"equals": employee}},
             ]
         }
-        res = notion.databases.query(database_id=OVERTIME_COUNT_DB_ID, page_size=5, filter=flt)
+        res = notion.databases.query(database_id=_normalize_notion_db_id(OVERTIME_COUNT_DB_ID), page_size=5, filter=flt)
         results = (res or {}).get("results", []) or []
         if not results:
             return 0.0
@@ -1725,7 +1749,7 @@ def upsert_overtime_count_to_notion(employee: str, y: int, m: int, hours: float,
                 {"property": k_emp, "title": {"equals": employee}},
             ]
         }
-        res = notion.databases.query(database_id=OVERTIME_COUNT_DB_ID, page_size=5, filter=flt)
+        res = notion.databases.query(database_id=_normalize_notion_db_id(OVERTIME_COUNT_DB_ID), page_size=5, filter=flt)
         results = (res or {}).get("results", []) or []
         page_id = results[0]["id"] if results else None
 
@@ -2019,16 +2043,6 @@ def upsert_overtime_rule_to_notion(y: int, m: int, shift_hours: float, hourly_ra
 
     props_meta = get_db_properties(OVERTIME_RULE_DB_ID) or {}
 
-    # ⚠️ 若 props_meta 為空，最常見原因：Notion Integration 沒有被「分享」到這個資料庫
-    # Notion API 會回 404（Not Found），導致我們抓不到任何欄位（包含 title）
-    if not props_meta:
-        raise RuntimeError(
-            "❌ 找不到加班設定表的欄位清單（Notion API 回傳空）。\n"
-            "最常見原因：你尚未把【加班設定表】分享給 Notion Integration（Company_System_Bot）。\n"
-            "請到 Notion 開啟【加班設定表】→ 右上角『分享』→ 邀請『Company_System_Bot』→ 權限選『可編輯』。\n"
-            f"DB_ID={OVERTIME_RULE_DB_ID}"
-        )
-
     def _norm(s: str) -> str:
         return str(s or "").replace(" ", "").replace("　", "").strip().lower()
 
@@ -2056,7 +2070,19 @@ def upsert_overtime_rule_to_notion(y: int, m: int, shift_hours: float, hourly_ra
             return _find_prop_by_type(fallback_type)
         return None
 
-    k_title = _resolve(["名稱", "name", "title"], fallback_type="title")
+    k_title = _find_prop_by_type("title")
+
+    # 有些情況會另外存在一個叫「名稱」的文字欄位（rich_text），而 Title 欄位本身可能被改名成別的。
+    # 這裡會：Title 一定寫入到 type=title 的欄位；若同時存在 rich_text 的「名稱」，也一併寫入，避免畫面看起來像沒填。
+    k_name_text: str | None = None
+    for _k, _v in (props_meta or {}).items():
+        try:
+            if _norm(_k) == _norm("名稱") and (_v or {}).get("type") == "rich_text":
+                k_name_text = _k
+                break
+        except Exception:
+            pass
+
     k_year  = _resolve(["年份", "年度", "year"], fallback_type="number")
     k_month = _resolve(["月份", "月", "month"], fallback_type="number")
     k_shift = _resolve(["班次換算時數", "換算時數", "班次時數", "shift", "hours"], fallback_type="number")
@@ -2064,17 +2090,13 @@ def upsert_overtime_rule_to_notion(y: int, m: int, shift_hours: float, hourly_ra
     k_note  = _resolve(["備註", "note", "備註說明"], fallback_type="rich_text")
 
     if not k_title:
-        # 額外把欄位清單列出，方便你直接比對 Notion 欄位名稱/型態
-        title_candidates = [k for k, v in props_meta.items() if (v or {}).get("type") == "title"]
-        raise RuntimeError(
-            "❌ 找不到加班設定表的 Title 欄位（type=title）。\n"
-            f"欄位清單：{list(props_meta.keys())}\n"
-            f"偵測到的 title 欄位：{title_candidates}"
-        )
+        raise RuntimeError(f"❌ 找不到加班設定表的 Title 欄位（type=title）。請確認資料庫存在可用的 Title 欄位。欄位清單：{list((props_meta or {}).keys())}")
 
     payload: dict = {
         k_title: {"title": [{"text": {"content": f"{int(y)}-{int(m):02d}"}}]}
     }
+    if k_name_text:
+        payload[k_name_text] = {"rich_text": [{"text": {"content": f"{int(y)}-{int(m):02d}"}}]}
 
     def _num(v):
         try:
@@ -2938,7 +2960,7 @@ def calc_used_vacation_hours(employee_name: str, year: int) -> float:
 # =========================
 def list_employee_names(limit: int = 200):
     try:
-        res = notion.databases.query(database_id=ACCOUNT_DB_ID, page_size=min(limit, 100))
+        res = notion.databases.query(database_id=_normalize_notion_db_id(ACCOUNT_DB_ID), page_size=min(limit, 100))
         names = []
         for page in res.get("results", []):
             props = page["properties"]
@@ -4150,7 +4172,7 @@ def create_lunch_record(employee_name: str, lunch_date: date, amount: float, act
         # 兼容：若先前曾快取到空的 properties（例如當時 DB ID/權限有誤），這裡再強制重抓一次
         if not props_meta:
             try:
-                _db = notion.databases.retrieve(database_id=LUNCH_DB_ID)
+                _db = notion.databases.retrieve(database_id=_normalize_notion_db_id(LUNCH_DB_ID))
                 props_meta = _db.get("properties", {}) or {}
             except Exception:
                 pass
