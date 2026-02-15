@@ -1421,6 +1421,17 @@ def render_duty_schedule_page():
                                 float(hourly_rate),
                                 note or "",
                             )
+                            # ✅ 操作記錄：加班設定寫入
+                            try:
+                                who = (st.session_state.get("employee_name") or st.session_state.get("user") or "系統")
+                                log_action(
+                                    who,
+                                    "加班設定",
+                                    f"{int(yy)}-{int(mm):02d} | 1次={float(shift_hours)}h | 時薪={float(hourly_rate)}" + (f" | {note.strip()}" if (note or "").strip() else ""),
+                                    "成功",
+                                )
+                            except Exception:
+                                pass
                             st.success(f"✅ 已寫入 Notion（page_id: {page_id[:8]}...）")
                             st.session_state["open_overtime_rule_dialog"] = False
                             st.rerun()
@@ -1997,98 +2008,106 @@ def _get_default_shift_options() -> list[str]:
     return ["收費員(中)", "收費員(晚)", "檢驗線(中)", "檢驗線(晚)"]
 
 
-def upsert_overtime_rule_to_notion(
-    y: int,
-    m: int,
-    shift_hours: float,
-    hourly_rate: float,
-    note: str = "",
-) -> str:
-    """同年同月：有就更新，沒有就新增（加班設定表）。回傳 page_id。"""
+def upsert_overtime_rule_to_notion(y: int, m: int, shift_hours: float, hourly_rate: float, note: str) -> str:
+    """同年同月：有就更新，沒有就新增。回傳 page_id。
+
+    ⚠️ DB 欄位名稱可能被改過（例如多了括號/空白），因此這裡用「自動對應」欄位，避免 payload 被過濾到空字典，導致 Notion 只建立時間卻沒有任何欄位值。
+    """
+
     if not OVERTIME_RULE_DB_ID:
-        raise RuntimeError("尚未設定 OVERTIME_RULE_DB_ID（加班設定表 DB ID）")
+        raise RuntimeError("❌ 尚未設定 OVERTIME_RULE_DB_ID（加班設定表 Database ID）")
 
-    # 讀 DB schema（避免欄位型別不一致）
-    db = notion.databases.retrieve(database_id=OVERTIME_RULE_DB_ID)
-    props = (db or {}).get("properties", {}) or {}
+    props_meta = get_db_properties(OVERTIME_RULE_DB_ID) or {}
 
-    def _ptype(name: str) -> str | None:
-        return (props.get(name) or {}).get("type")
+    def _norm(s: str) -> str:
+        return str(s or "").replace(" ", "").replace("　", "").strip().lower()
 
-    def _rt(val: str):
-        return {"rich_text": [{"text": {"content": str(val)}}]}
+    def _find_prop_by_type(p_type: str) -> str | None:
+        for k, v in props_meta.items():
+            if (v or {}).get("type") == p_type:
+                return k
+        return None
 
-    def _title(val: str):
-        return {"title": [{"text": {"content": str(val)}}]}
+    def _resolve(candidates: list[str], fallback_type: str | None = None) -> str | None:
+        keys = list(props_meta.keys())
+        cset = [_norm(c) for c in candidates if c]
+        # exact
+        for k in keys:
+            if _norm(k) in cset:
+                return k
+        # contains
+        for k in keys:
+            nk = _norm(k)
+            for c in cset:
+                if c and c in nk:
+                    return k
+        # type fallback
+        if fallback_type:
+            return _find_prop_by_type(fallback_type)
+        return None
 
-    def _num(val):
-        try:
-            return {"number": float(val)}
-        except Exception:
-            return {"number": None}
+    k_title = _resolve(["名稱", "name", "title"], fallback_type="title")
+    k_year  = _resolve(["年份", "年度", "year"], fallback_type="number")
+    k_month = _resolve(["月份", "月", "month"], fallback_type="number")
+    k_shift = _resolve(["班次換算時數", "換算時數", "班次時數", "shift", "hours"], fallback_type="number")
+    k_rate  = _resolve(["加班時薪", "時薪", "hourly", "rate"], fallback_type="number")
+    k_note  = _resolve(["備註", "note", "備註說明"], fallback_type="rich_text")
 
-    def _ms(vals: list[str]):
-        return {"multi_select": [{"name": str(v)} for v in vals if str(v).strip()]}
+    if not k_title:
+        raise RuntimeError("❌ 找不到加班設定表的 Title 欄位（名稱）")
 
-    def _sel(val: str):
-        return {"select": {"name": str(val)}} if str(val).strip() else {"select": None}
-
-    def _set(name: str, value):
-        t = _ptype(name)
-        if t == "title":
-            return _title(value)
-        if t == "number":
-            return _num(value)
-        if t == "rich_text":
-            return _rt(value)
-        if t == "select":
-            return _sel(value)
-        if t == "multi_select":
-            # value 可能是 list[str] 或字串
-            if isinstance(value, (list, tuple)):
-                return _ms(list(value))
-            return _ms([str(value)])
-        # fallback：當作 rich_text
-        return _rt(value)
-
-    name = f"{int(y)}-{int(m):02d}"
-
-    payload = {
-        "名稱": _set("名稱", name),
-        "年份": _set("年份", int(y)),
-        "月份": _set("月份", int(m)),
-        "班次換算時數": _set("班次換算時數", shift_hours),
-        "加班時薪": _set("加班時薪", hourly_rate),
-        "備註": _set("備註", note or ""),
+    payload: dict = {
+        k_title: {"title": [{"text": {"content": f"{int(y)}-{int(m):02d}"}}]}
     }
 
-    # 只送 DB 真的存在的欄位（避免 Notion 噴錯）
-    payload = {k: v for k, v in payload.items() if k in props}
+    def _num(v):
+        try:
+            return float(v)
+        except Exception:
+            return None
 
-    # 查同年同月是否已存在
-    res = notion.databases.query(
-        database_id=OVERTIME_RULE_DB_ID,
-        page_size=5,
-        filter={
-            "and": [
-                {"property": "年份", "number": {"equals": int(y)}},
-                {"property": "月份", "number": {"equals": int(m)}},
-            ]
-        },
-    )
-    results = (res or {}).get("results", []) or []
-    if results:
-        page_id = results[0]["id"]
-        notion.pages.update(page_id=page_id, properties=payload)
-        return page_id
+    if k_year and props_meta.get(k_year, {}).get("type") == "number":
+        payload[k_year] = {"number": int(y)}
+    if k_month and props_meta.get(k_month, {}).get("type") == "number":
+        payload[k_month] = {"number": int(m)}
+    if k_shift and props_meta.get(k_shift, {}).get("type") == "number":
+        vv = _num(shift_hours)
+        if vv is not None:
+            payload[k_shift] = {"number": vv}
+    if k_rate and props_meta.get(k_rate, {}).get("type") == "number":
+        vv = _num(hourly_rate)
+        if vv is not None:
+            payload[k_rate] = {"number": vv}
 
-    created = notion.pages.create(
-        parent={"database_id": OVERTIME_RULE_DB_ID},
-        properties=payload,
-    )
-    return (created or {}).get("id", "")
+    if k_note:
+        t = str(note or "").strip()
+        if (props_meta.get(k_note, {}) or {}).get("type") == "rich_text":
+            payload[k_note] = {"rich_text": [{"text": {"content": t}}]} if t else {"rich_text": []}
 
+    existing_id = None
+    if k_year and k_month and (k_year in props_meta) and (k_month in props_meta):
+        try:
+            res = notion.databases.query(
+                database_id=OVERTIME_RULE_DB_ID,
+                page_size=10,
+                filter={
+                    "and": [
+                        {"property": k_year, "number": {"equals": int(y)}},
+                        {"property": k_month, "number": {"equals": int(m)}},
+                    ]
+                },
+            )
+            if res.get("results"):
+                existing_id = res["results"][0]["id"]
+        except Exception:
+            existing_id = None
 
+    if existing_id:
+        notion.pages.update(page_id=existing_id, properties=payload)
+        return existing_id
+
+    created = notion.pages.create(parent={"database_id": OVERTIME_RULE_DB_ID}, properties=payload)
+    return created["id"]
 def query_duty_month_to_horizontal_df(y: int, m: int, employees: list[str]):
     """
     ✅ 依你目前 Notion【值班排班表】的欄位結構查詢（一天一筆）：
