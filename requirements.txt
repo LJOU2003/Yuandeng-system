@@ -6,3 +6,4 @@ requests
 bcrypt
 streamlit-js-eval
 altair
+openpyxl
