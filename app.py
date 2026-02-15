@@ -1401,7 +1401,7 @@ def render_duty_schedule_page():
                 mm = st.number_input("月份", min_value=1, max_value=12, value=int(st.session_state.get("duty_m", datetime.now().month)), step=1, key="ot_rule_m")
 
                 st.caption("名稱會自動產生（YYYY-MM）")
-                st.text_input("名稱", value=f"{int(yy)}-{int(mm):02d}", disabled=True, key="ot_rule_name")
+                st.text_input("紀錄", value=f"{int(yy)}-{int(mm):02d}", disabled=True, key="ot_rule_name")
 
                 c1, c2 = st.columns(2)
                 with c1:
