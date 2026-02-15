@@ -13,34 +13,6 @@ from streamlit_js_eval import get_geolocation
 import bcrypt
 import re
 
-# =========================
-# 🧩 Notion ID 正規化（非常關鍵）
-# - 支援：32 碼、帶連字號 UUID、或整段 notion.so URL
-# - 回傳：帶連字號的 UUID（Notion API 最穩）
-# =========================
-def _normalize_notion_id(raw: str | None) -> str | None:
-    if not raw:
-        return None
-    s = str(raw).strip()
-
-    # 若是整段 URL：取最後一段，並抓出 32 碼 hex
-    # 例：https://www.notion.so/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx?v=...
-    m = re.search(r"([0-9a-fA-F]{32})", s)
-    if m:
-        s = m.group(1)
-    else:
-        # 若已是帶 dash 的 UUID
-        m2 = re.search(r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})", s)
-        if m2:
-            return m2.group(1).lower()
-
-    s = s.replace("-", "").strip()
-    if not re.fullmatch(r"[0-9a-fA-F]{32}", s):
-        return None
-
-    s = s.lower()
-    return f"{s[0:8]}-{s[8:12]}-{s[12:16]}-{s[16:20]}-{s[20:32]}"
-
 
 # =========================
 # 0) 讀取環境變數 (Notion Token / DB ID)
@@ -490,29 +462,53 @@ def _normalize_notion_id(raw: str | None) -> str | None:
 
 @st.cache_data(ttl=60)
 def get_db_properties(database_id: str, force_refresh: bool = False, **_kwargs) -> dict:
-    """取得 Notion DB 的 properties。
+    """取得 Notion DB 的 properties（schema）。
 
-    你的流程會呼叫 get_db_properties(db_id, force_refresh=True) 來強制重抓欄位。
-    本函式原本沒有 force_refresh 參數會直接報錯：
-        get_db_properties() got an unexpected keyword argument 'force_refresh'
+    ✅ 這支是你整個系統能否「正確寫入」的關鍵。
+    你遇到「新增成功但資料庫是空白」的真正原因，就是這裡回傳了 {}，
+    導致後面組出來的 properties 也是空的，但 Notion 仍會建立一筆 page。
 
-    這裡修正為：
-    1) force_refresh=True 時清除 st.cache_data 快取
-    2) 把 DB ID 統一正規化（支援 32 碼、帶 dash、或整段網址）
+    本版做了 3 層保護：
+    1) 先用 databases.retrieve 取 schema（最完整）
+    2) 若 retrieve 失敗/回空，改用 databases.query 抓任一筆既有 page 的 properties，
+       從回傳值推回「欄位名稱 -> 型態」（可用於寫入）
+    3) force_refresh=True 時清掉 cache（若外層用 st.cache_data 包過也能清）
     """
     try:
         if force_refresh:
             try:
-                get_db_properties.clear()
+                get_db_properties.clear()  # type: ignore[attr-defined]
             except Exception:
                 pass
 
         dbid = _normalize_notion_id(database_id) or database_id
-        db = notion.databases.retrieve(database_id=dbid)
-        return db.get("properties", {}) or {}
+
+        # 1) 優先 retrieve schema
+        try:
+            db = notion.databases.retrieve(database_id=dbid)
+            props = db.get("properties", {}) or {}
+            if props:
+                return props
+        except Exception:
+            props = {}
+
+        # 2) fallback：用 query 的第一筆 page 推回欄位型態（避開 retrieve 偶發空值/權限問題）
+        try:
+            res = notion.databases.query(database_id=dbid, page_size=1)
+            results = res.get("results", []) or []
+            if results:
+                page_props = (results[0] or {}).get("properties", {}) or {}
+                # page 回傳的是「值」，但每個欄位也會帶 type
+                inferred = {k: {"type": (v or {}).get("type")} for k, v in page_props.items()}
+                # 避免 inferred 全是 None
+                inferred = {k: v for k, v in inferred.items() if v.get("type")}
+                if inferred:
+                    return inferred
+        except Exception:
+            pass
+
+        return {}
     except Exception as e:
-        # ✅ 佈署到 Streamlit Cloud 時，如果 secrets/token/權限或 DB_ID 有問題，這裡會失敗
-        #    開啟 DEBUG_NOTION=1 才顯示錯誤，避免一般使用者看到內部訊息
         if os.getenv("DEBUG_NOTION", "").strip() == "1":
             st.error(f"❌ Notion 讀取資料庫欄位失敗（{database_id}）：{e}")
         return {}
@@ -1111,7 +1107,10 @@ def create_announcement(publish_date: date, content: str, end_date: date | None,
         if end_date and end_prop:
             props[end_prop] = {"date": {"start": datetime.combine(end_date, datetime.min.time()).isoformat()}}
 
-        notion.pages.create(parent={"database_id": ANNOUNCE_DB_ID}, properties=props)
+        dbid = _normalize_notion_id(ANNOUNCE_DB_ID) or ANNOUNCE_DB_ID
+        if not props:
+            raise RuntimeError("Notion properties is empty（請確認 DB 權限/欄位名稱）")
+        notion.pages.create(parent={"database_id": dbid}, properties=props)
         log_action(actor or "—", "公告管理", f"新增公告：{publish_date.isoformat()}｜{content[:30]}", "成功")
         return True
 
@@ -4235,7 +4234,10 @@ def create_lunch_record(employee_name: str, lunch_date: date, amount: float, act
         if has_prop("訂餐日期"):
             props["訂餐日期"] = {"date": {"start": datetime.combine(lunch_date, datetime.min.time()).isoformat()}}
 
-        notion.pages.create(parent={"database_id": LUNCH_DB_ID}, properties=props)
+        dbid = _normalize_notion_id(LUNCH_DB_ID) or LUNCH_DB_ID
+        if not props:
+            raise RuntimeError("Notion properties is empty（請確認 DB 權限/欄位名稱）")
+        notion.pages.create(parent={"database_id": dbid}, properties=props)
         log_action(actor or employee_name, "午餐訂餐", f"{employee_name}｜{lunch_date.isoformat()}｜${float(amount or 0):.0f}", "成功")
         return True
 
@@ -6488,603 +6490,3 @@ else:
 # ✅ Global footer
 # =========================
 render_footer()
-
-
-
-# ============================================================
-# ✅ LJOU Hotfix Patch (stability override)
-#  - Fix NameError: _normalize_notion_id / _normalize_notion_id mismatch
-#  - Fix get_db_properties(force_refresh=...) unexpected keyword
-#  - Make "公告新增" / "午餐新增" use DB meta to map correct欄位，避免寫入空白
-#  - Ensure 操作記錄表僅在 Notion API 成功後才寫「成功」
-# ============================================================
-
-def _normalize_notion_id(raw: str | None) -> str | None:
-    """Accepts DB/Page id or Notion URL; returns 32-hex id without dashes."""
-    if not raw:
-        return None
-    s = str(raw).strip()
-    s = s.split("?")[0].rstrip("/")
-    s = s.split("/")[-1]
-    s = s.replace("-", "")
-    s2 = re.sub(r"[^0-9a-fA-F]", "", s)
-    if len(s2) == 32:
-        return s2.lower()
-    if len(s2) > 32:
-        return s2[-32:].lower()
-    return s2.lower() if s2 else None
-
-# backward-compat aliases
-_normalize_notion_id = _normalize_notion_id  # type: ignore
-
-
-def _norm_prop_name(s: str) -> str:
-    if s is None:
-        return ""
-    s = str(s)
-    trans = str.maketrans({"（": "(", "）": ")", "　": " ", "\u00A0": " "})
-    s = s.translate(trans)
-    s = s.replace(" ", "")
-    return s.strip().lower()
-
-
-def get_db_properties(database_id: str, force_refresh: bool = False):
-    """Unified DB properties getter (final override)."""
-    if not database_id:
-        return {}
-    dbid = _normalize_notion_id(database_id) or database_id
-    cache = st.session_state.setdefault("_db_props_cache", {})
-    if force_refresh:
-        cache.pop(dbid, None)
-    if dbid in cache:
-        return cache[dbid]
-    try:
-        res = notion.databases.retrieve(database_id=dbid)
-        props = (res or {}).get("properties", {}) or {}
-        cache[dbid] = props
-        return props
-    except Exception:
-        return {}
-
-
-def resolve_title_prop_name(database_id: str) -> str | None:
-    props = get_db_properties(database_id, force_refresh=False) or {}
-    for k, meta in props.items():
-        if (meta or {}).get("type") == "title":
-            return k
-    return None
-
-
-def _find_prop_by_name_and_type(props_meta: dict, want_names: list[str], want_type: str | None = None) -> str | None:
-    wants_norm = {_norm_prop_name(n) for n in (want_names or []) if n}
-    for k, meta in (props_meta or {}).items():
-        if _norm_prop_name(k) in wants_norm:
-            if want_type is None or (meta or {}).get("type") == want_type:
-                return k
-    return None
-
-
-def _find_first_by_type(props_meta: dict, want_type: str) -> str | None:
-    for k, meta in (props_meta or {}).items():
-        if (meta or {}).get("type") == want_type:
-            return k
-    return None
-
-
-def _safe_date_start(d: date) -> str:
-    return datetime.combine(d, datetime.min.time()).isoformat()
-
-
-def _make_title_from_content(content: str, n: int = 3) -> str:
-    c = (content or "").strip().replace("\r", " ").replace("\n", " ")
-    head = c[:n].strip()
-    return head or "—"
-
-
-def create_announcement(publish_date: date, content: str, end_date: date | None, actor: str = "") -> bool:
-    if not ANNOUNCE_DB_ID:
-        st.error("❌ 尚未設定 ANNOUNCE_DB_ID（公告紀錄表 Database ID）")
-        return False
-
-    content = (content or "").strip()
-    if not content:
-        st.error("❌ 公告內容不可為空")
-        return False
-
-    dbid = _normalize_notion_id(ANNOUNCE_DB_ID) or ANNOUNCE_DB_ID
-    props_meta = get_db_properties(dbid, force_refresh=True) or {}
-
-    title_key = resolve_title_prop_name(dbid) or _find_first_by_type(props_meta, "title")
-    if not title_key:
-        st.error("❌ 找不到公告表的 Title 欄位（type=title）。請確認 Integration 已共享此資料庫。")
-        return False
-
-    done_key = _find_prop_by_name_and_type(props_meta, ["完成情況", "完成狀態"], "checkbox")
-    pub_key = _find_prop_by_name_and_type(props_meta, ["發布日期", "發佈日期", "發布時間"], "date")
-    end_key = _find_prop_by_name_and_type(props_meta, ["結束時間", "結束日期"], "date")
-
-    content_key = (
-        _find_prop_by_name_and_type(props_meta, ["公告內容", "內容"], "rich_text")
-        or _find_prop_by_name_and_type(props_meta, ["公告內容", "內容"], "title")
-        or _find_first_by_type(props_meta, "rich_text")
-    )
-
-    props: dict = {}
-    props[title_key] = {"title": [{"text": {"content": _make_title_from_content(content, 3)}}]}
-
-    if done_key:
-        props[done_key] = {"checkbox": False}
-    if pub_key:
-        props[pub_key] = {"date": {"start": _safe_date_start(publish_date)}}
-    if end_date and end_key:
-        props[end_key] = {"date": {"start": _safe_date_start(end_date)}}
-
-    if content_key:
-        ctype = (props_meta.get(content_key) or {}).get("type")
-        if ctype == "title":
-            props[content_key] = {"title": [{"text": {"content": content}}]}
-        else:
-            props[content_key] = {"rich_text": [{"text": {"content": content}}]}
-
-    try:
-        notion.pages.create(parent={"database_id": dbid}, properties=props)
-        log_action(actor or "—", "公告管理", f"新增公告：{publish_date.isoformat()}｜{content[:30]}", "成功")
-        return True
-    except Exception as e:
-        st.error(f"新增公告失敗：{e}")
-        log_action(actor or "—", "公告管理", f"新增公告失敗：{e}", "系統錯誤")
-        return False
-
-
-def create_lunch_order(employee_name: str, lunch_date: date, amount: float, actor: str = "") -> bool:
-    if not LUNCH_DB_ID:
-        st.error("❌ 尚未設定 LUNCH_DB_ID（午餐訂餐表 Database ID）")
-        return False
-
-    employee_name = (employee_name or "").strip()
-    if not employee_name:
-        st.error("❌ 員工姓名不可為空")
-        return False
-
-    dbid = _normalize_notion_id(LUNCH_DB_ID) or LUNCH_DB_ID
-    props_meta = get_db_properties(dbid, force_refresh=True) or {}
-
-    title_key = resolve_title_prop_name(dbid) or _find_first_by_type(props_meta, "title")
-    if not title_key:
-        st.error("❌ 找不到午餐表的 Title 欄位（type=title）。請確認 Integration 已共享此資料庫。")
-        return False
-
-    amt_key = (
-        _find_prop_by_name_and_type(props_meta, ["訂餐金額", "金額", "餐費"], "number")
-        or _find_first_by_type(props_meta, "number")
-    )
-    date_key = (
-        _find_prop_by_name_and_type(props_meta, ["訂餐日期", "日期", "訂餐時間"], "date")
-        or _find_first_by_type(props_meta, "date")
-    )
-
-    props: dict = {title_key: {"title": [{"text": {"content": employee_name}}]}}
-    if amt_key:
-        props[amt_key] = {"number": float(amount or 0)}
-    if date_key:
-        props[date_key] = {"date": {"start": _safe_date_start(lunch_date)}}
-
-    try:
-        notion.pages.create(parent={"database_id": dbid}, properties=props)
-        log_action(actor or employee_name, "午餐訂餐", f"{employee_name}｜{lunch_date.isoformat()}｜${float(amount or 0):.0f}", "成功")
-        return True
-    except Exception as e:
-        st.error(f"寫入午餐訂餐失敗：{e}")
-        log_action(actor or employee_name, "午餐訂餐", f"寫入失敗：{e}", "系統錯誤")
-        return False
-
-
-# --- Compatibility aliases ---
-globals().setdefault("add_lunch_record", create_lunch_order)
-globals().setdefault("create_lunch_record", create_lunch_order)
-
-
-
-
-# =========================
-# 🔧 HOTFIX (2026-02-15)
-# 目的：修正「寫入成功但資料庫欄位空白」與 force_refresh / _normalize_notion_id 相關錯誤
-# 策略：
-#  1) 以 Notion DB「欄位名稱」為主做對位（保留 type 只用來決定 payload 的 key：title/rich_text/number/date...）
-#  2) get_db_properties 統一收斂為單一入口，支援 force_refresh，且取不到 properties 直接丟錯（避免默默回傳 {} 造成寫入空白）
-#  3) 公告/午餐 寫入時：若抓不到欄位就直接 fail，不再產生空白列
-# =========================
-
-import re as _re
-
-def _normalize_notion_id(raw: str) -> str:
-    """把 32 碼/帶連字號/URL 形式的 Notion ID 轉成帶連字號的 UUID 格式。"""
-    if not raw:
-        return ""
-    s = str(raw).strip()
-    # 取最後一段（避免帶 URL、參數）
-    s = s.split("?")[0].rstrip("/")
-    s = s.split("/")[-1]
-    # 移除連字號
-    hex32 = _re.sub(r"[^0-9a-fA-F]", "", s)
-    if len(hex32) != 32:
-        return raw  # 原樣回傳，讓 Notion SDK 自己處理（或後續報錯）
-    return f"{hex32[0:8]}-{hex32[8:12]}-{hex32[12:16]}-{hex32[16:20]}-{hex32[20:32]}"
-
-def _norm_prop_name(name: str) -> str:
-    return _re.sub(r"\\s+", "", (name or "").strip().lower())
-
-def get_db_properties(database_id: str, force_refresh: bool = False, **_kwargs):
-    """取得 Notion DB 欄位定義（以欄位名稱為 key）。取不到就丟錯，避免後續寫入空白。"""
-    if not database_id:
-        raise ValueError("database_id is empty")
-
-    dbid = _normalize_notion_id(database_id) or database_id
-    cache = st.session_state.setdefault("_db_prop_cache", {})
-
-    if force_refresh or (dbid not in cache):
-        db = notion.databases.retrieve(database_id=dbid)
-        props = (db or {}).get("properties") or {}
-        if not props:
-            raise RuntimeError("Notion DB properties is empty (可能是 Integration 未共享或 DB_ID 不正確)")
-        cache[dbid] = props
-
-    return cache[dbid]
-
-def _find_prop_key_by_name(props_meta: dict, candidates: list[str]) -> str | None:
-    """用『欄位名稱』找 key（忽略空白/大小寫），回傳實際存在的欄位名。"""
-    if not props_meta:
-        return None
-    want = {_norm_prop_name(c) for c in (candidates or []) if c}
-    for k in props_meta.keys():
-        if _norm_prop_name(k) in want:
-            return k
-    return None
-
-def _first_title_key(props_meta: dict) -> str | None:
-    for k, v in (props_meta or {}).items():
-        if (v or {}).get("type") == "title":
-            return k
-    return None
-
-def _make_rich_text(content: str):
-    return [{"text": {"content": content or ""}}]
-
-def _safe_date_start(d: date | datetime | None) -> str | None:
-    if not d:
-        return None
-    if isinstance(d, datetime):
-        return d.isoformat()
-    return datetime.combine(d, datetime.min.time()).isoformat()
-
-def _set_prop_value(props_meta: dict, prop_key: str, value):
-    """依 Notion schema type 產生正確 payload（title/rich_text/number/date/checkbox/select...）。"""
-    ptype = (props_meta.get(prop_key) or {}).get("type")
-
-    if ptype == "title":
-        return {"title": _make_rich_text(str(value or ""))}
-    if ptype == "rich_text":
-        return {"rich_text": _make_rich_text(str(value or ""))}
-    if ptype == "number":
-        try:
-            return {"number": float(value or 0)}
-        except Exception:
-            return {"number": 0}
-    if ptype == "date":
-        start = _safe_date_start(value)
-        return {"date": {"start": start}} if start else {"date": None}
-    if ptype == "checkbox":
-        return {"checkbox": bool(value)}
-    if ptype == "select":
-        # value 應為 option name
-        return {"select": {"name": str(value)}} if value else {"select": None}
-    if ptype == "multi_select":
-        if not value:
-            return {"multi_select": []}
-        if isinstance(value, (list, tuple)):
-            return {"multi_select": [{"name": str(x)} for x in value]}
-        return {"multi_select": [{"name": str(value)}]}
-    # 其他 type 先不硬塞，避免 validation error
-    return None
-
-def create_lunch_order(employee_name: str, lunch_date: date, amount: float, actor: str = "") -> bool:
-    """新增午餐訂餐（以欄位名稱對位；找不到欄位就直接失敗，避免寫入空白列）。"""
-    if not LUNCH_DB_ID:
-        st.error("❌ 尚未設定 LUNCH_DB_ID（午餐訂餐表 Database ID）")
-        return False
-
-    employee_name = (employee_name or "").strip()
-    if not employee_name:
-        st.error("❌ 員工姓名不可為空")
-        return False
-
-    try:
-        dbid = _normalize_notion_id(LUNCH_DB_ID) or LUNCH_DB_ID
-        meta = get_db_properties(dbid, force_refresh=True)
-
-        k_emp = _find_prop_key_by_name(meta, ["員工姓名", "姓名", "Name"]) or _first_title_key(meta)
-        k_amt = _find_prop_key_by_name(meta, ["訂餐金額", "金額", "餐費"])
-        k_date = _find_prop_key_by_name(meta, ["訂餐日期", "日期"])
-
-        if not k_emp:
-            raise RuntimeError("找不到『員工姓名』(或任何 title 欄位)；請確認午餐訂餐表 DB 欄位名稱與 Integration 權限")
-
-        props = {}
-        v = _set_prop_value(meta, k_emp, employee_name)
-        if v: props[k_emp] = v
-
-        if k_amt:
-            v = _set_prop_value(meta, k_amt, amount)
-            if v: props[k_amt] = v
-        else:
-            raise RuntimeError("找不到『訂餐金額』欄位（或同義欄位）")
-
-        if k_date:
-            v = _set_prop_value(meta, k_date, lunch_date)
-            if v: props[k_date] = v
-        else:
-            raise RuntimeError("找不到『訂餐日期』欄位（或同義欄位）")
-
-        notion.pages.create(parent={"database_id": dbid}, properties=props)
-        log_action(actor or employee_name, "午餐訂餐", f"{employee_name}｜{lunch_date.isoformat()}｜${float(amount or 0):.0f}", "成功")
-        return True
-
-    except Exception as e:
-        st.error(f"寫入午餐訂餐失敗：{e}")
-        log_action(actor or employee_name, "午餐訂餐", f"寫入失敗：{e}", "系統錯誤")
-        return False
-
-def create_announce(publish_date: date, content: str, end_date: date | None = None, actor: str = "") -> bool:
-    """新增公告（以欄位名稱對位；Title 內容用公告內容前 3 字，避免你不想維護標題）。"""
-    if not ANNOUNCE_DB_ID:
-        st.error("❌ 尚未設定 ANNOUNCE_DB_ID（公告記錄表 Database ID）")
-        return False
-
-    content = (content or "").strip()
-    if not content:
-        st.error("❌ 公告內容不可為空")
-        return False
-
-    try:
-        dbid = _normalize_notion_id(ANNOUNCE_DB_ID) or ANNOUNCE_DB_ID
-        meta = get_db_properties(dbid, force_refresh=True)
-
-        # 依你截圖：完成情況 / 發布日期 / 公告內容 / 結束時間 / 上次編輯時間(系統)
-        k_title = _first_title_key(meta)
-        if not k_title:
-            raise RuntimeError("找不到公告表的 title 欄位（Notion DB 必定有一個 title）。請確認 Integration 已共享此資料庫。")
-
-        k_done = _find_prop_key_by_name(meta, ["完成情況", "完成狀態"])
-        k_pub  = _find_prop_key_by_name(meta, ["發布日期", "發佈日期", "發布時間"])
-        k_end  = _find_prop_key_by_name(meta, ["結束時間", "結束日期"])
-        k_body = _find_prop_key_by_name(meta, ["公告內容", "內容"])
-
-        if not k_body:
-            raise RuntimeError("找不到『公告內容/內容』欄位；請確認你公告表的文字欄位名稱")
-
-        props = {}
-        # Title 用前三字（你不填名稱也沒關係）
-        props[k_title] = {"title": _make_rich_text(content[:3])}
-
-        v = _set_prop_value(meta, k_body, content)
-        if v: props[k_body] = v
-
-        if k_done:
-            v = _set_prop_value(meta, k_done, False)
-            if v: props[k_done] = v
-
-        if k_pub:
-            v = _set_prop_value(meta, k_pub, publish_date)
-            if v: props[k_pub] = v
-
-        if end_date and k_end:
-            v = _set_prop_value(meta, k_end, end_date)
-            if v: props[k_end] = v
-
-        notion.pages.create(parent={"database_id": dbid}, properties=props)
-        log_action(actor or "—", "公告管理", f"新增公告：{publish_date.isoformat()}｜{content[:30]}", "成功")
-        return True
-
-    except Exception as e:
-        st.error(f"新增公告失敗：{e}")
-        log_action(actor or "—", "公告管理", f"新增公告失敗：{e}", "系統錯誤")
-        return False
-
-# 讓舊呼叫名稱也指向新的實作（避免 UI 邏輯找不到）
-globals()["add_announce"] = create_announce
-globals()["create_announcement"] = create_announce
-globals()["add_lunch_record"] = create_lunch_order
-globals()["create_lunch_record"] = create_lunch_order
-
-
-# =====================================================================
-# ✅ FINAL OVERRIDE (2026-02-15)
-# 目的：把「公告 / 午餐 / 加班設定」寫入流程改成『操作記錄表』同款的
-#      「先用已知 title 欄位建立最小列 → 再逐欄位補寫」策略。
-# 好處：
-#   - 不再依賴 databases.retrieve() 一定要拿到 properties（避免你現在遇到的 empty props）
-#   - DB 欄位對位改成『以欄位名稱為主』，拿不到 schema 也照寫（寫失敗就略過並回報）
-# =====================================================================
-
-from datetime import datetime as _dt
-
-
-def get_db_properties(database_id: str, force_refresh: bool = False):
-    """安全取得 DB properties：拿不到就回傳 {}（絕不 raise）。
-
-    你的操作記錄表之所以一直能寫入，是因為它只需要『title 欄位』就能先建立 page，
-    後續欄位寫不進去也不會阻塞整個建立流程。
-
-    其他表先前會失敗，是因為我們把 properties 空/抓不到視為致命錯誤而直接 return。
-    這裡改回「可用則用、不可用也照寫」。
-    """
-    if not database_id:
-        return {}
-    try:
-        dbid = _normalize_notion_id(database_id) or database_id
-    except Exception:
-        dbid = database_id
-
-    cache = st.session_state.setdefault("_db_props_cache_final", {})
-    if force_refresh:
-        cache.pop(dbid, None)
-    if dbid in cache:
-        return cache[dbid]
-
-    try:
-        res = notion.databases.retrieve(database_id=dbid)
-        props = (res or {}).get("properties", {}) or {}
-        cache[dbid] = props
-        return props
-    except Exception:
-        cache[dbid] = {}
-        return {}
-
-
-def _first_title_prop_name(props_meta: dict) -> str | None:
-    for k, meta in (props_meta or {}).items():
-        if (meta or {}).get("type") == "title":
-            return k
-    return None
-
-
-def _pick_title_name(props_meta: dict, candidates: list[str]) -> str:
-    """優先用候選欄位名稱；沒有就用 schema 找到的第一個 title；再不行就用第一個候選。"""
-    for c in candidates:
-        if c and props_meta and c in props_meta:
-            return c
-    t = _first_title_prop_name(props_meta)
-    return t or (candidates[0] if candidates else "名稱")
-
-
-def _rt(text: str):
-    return [{"text": {"content": text or ""}}]
-
-
-def _safe_date_start2(d: date | datetime | None) -> str | None:
-    if not d:
-        return None
-    if isinstance(d, _dt):
-        return d.isoformat()
-    return _dt.combine(d, _dt.min.time()).isoformat()
-
-
-def _update_try(page_id: str, prop_name: str, value, prefer_types: list[str]):
-    """像操作記錄表一樣：同一個欄位用不同 Notion type payload 試到成功為止。"""
-    for t in prefer_types:
-        if t == "title":
-            ok, _ = _safe_update(page_id, {prop_name: {"title": _rt(str(value or ""))}})
-        elif t == "rich_text":
-            ok, _ = _safe_update(page_id, {prop_name: {"rich_text": _rt(str(value or ""))}})
-        elif t == "number":
-            try:
-                num = float(value or 0)
-            except Exception:
-                num = 0.0
-            ok, _ = _safe_update(page_id, {prop_name: {"number": num}})
-        elif t == "date":
-            start = _safe_date_start2(value)
-            ok, _ = _safe_update(page_id, {prop_name: {"date": {"start": start}}})
-        elif t == "checkbox":
-            ok, _ = _safe_update(page_id, {prop_name: {"checkbox": bool(value)}})
-        elif t == "status":
-            ok, _ = _safe_update(page_id, {prop_name: {"status": {"name": str(value)}}})
-        elif t == "select":
-            ok, _ = _safe_update(page_id, {prop_name: {"select": {"name": str(value)}}})
-        else:
-            continue
-        if ok:
-            return True
-    return False
-
-
-def _create_min_page(database_id: str, title_prop_candidates: list[str], title_text: str):
-    """建立最小可行 page（只寫 title）。這一步成功 = 至少不會再產生『完全空白』以外的錯誤。"""
-    dbid = _normalize_notion_id(database_id) or database_id
-    props_meta = get_db_properties(dbid, force_refresh=False) or {}
-    title_prop = _pick_title_name(props_meta, title_prop_candidates)
-
-    # 不依賴 schema：直接用 title payload 建立
-    created = notion.pages.create(
-        parent={"database_id": dbid},
-        properties={title_prop: {"title": _rt(title_text)}},
-    )
-    return created.get("id"), title_prop
-
-
-# ---------------------------
-# 公告：新增
-# ---------------------------
-
-def create_announcement(publish_date: date, content: str, end_date: date | None, actor: str = "") -> bool:
-    if not ANNOUNCE_DB_ID:
-        st.error("❌ 尚未設定 ANNOUNCE_DB_ID（公告紀錄表 Database ID）")
-        return False
-
-    content = (content or "").strip()
-    if not content:
-        st.error("❌ 公告內容不可為空")
-        return False
-
-    dbid = _normalize_notion_id(ANNOUNCE_DB_ID) or ANNOUNCE_DB_ID
-
-    try:
-        # 1) 先用『內容』當 title（你已經把 title 改成 內容）
-        title_text = _make_title_from_content(content, 3) if "_make_title_from_content" in globals() else (content[:3] or "—")
-        page_id, _ = _create_min_page(dbid, ["內容", "公告內容", "名稱", "Name"], title_text)
-
-        # 2) 再逐欄位補寫（欄位名稱為主；寫不進去就略過）
-        _update_try(page_id, "發布日期", publish_date, ["date"])
-        _update_try(page_id, "公告內容", content, ["rich_text", "title"])
-        if end_date:
-            _update_try(page_id, "結束時間", end_date, ["date"])
-        _update_try(page_id, "完成情況", False, ["checkbox"])
-
-        log_action(actor or "—", "公告管理", f"新增公告：{publish_date.isoformat()}｜{content[:30]}", "成功")
-        return True
-
-    except Exception as e:
-        st.error(f"新增公告失敗：{e}")
-        log_action(actor or "—", "公告管理", f"新增公告失敗：{e}", "系統錯誤")
-        return False
-
-
-# ---------------------------
-# 午餐：新增
-# ---------------------------
-
-def create_lunch_order(employee_name: str, lunch_date: date, amount: float, actor: str = "") -> bool:
-    if not LUNCH_DB_ID:
-        st.error("❌ 尚未設定 LUNCH_DB_ID（午餐訂餐表 Database ID）")
-        return False
-
-    employee_name = (employee_name or "").strip()
-    if not employee_name:
-        st.error("❌ 員工姓名不可為空")
-        return False
-
-    dbid = _normalize_notion_id(LUNCH_DB_ID) or LUNCH_DB_ID
-
-    try:
-        # 1) 先用『員工姓名』建立最小列（你的午餐表 title 就是 員工姓名）
-        page_id, _ = _create_min_page(dbid, ["員工姓名", "姓名", "名稱", "Name"], employee_name)
-
-        # 2) 再補寫金額/日期
-        _update_try(page_id, "訂餐金額", float(amount or 0), ["number"])
-        _update_try(page_id, "訂餐日期", lunch_date, ["date"])
-
-        log_action(actor or employee_name, "午餐訂餐", f"{employee_name}｜{lunch_date.isoformat()}｜${float(amount or 0):.0f}", "成功")
-        return True
-
-    except Exception as e:
-        st.error(f"寫入午餐訂餐失敗：{e}")
-        log_action(actor or employee_name, "午餐訂餐", f"寫入失敗：{e}", "系統錯誤")
-        return False
-
-
-# 舊名稱 alias（避免 UI 找不到）
-globals()["add_announce"] = create_announcement
-globals()["create_announce"] = create_announcement
-globals()["add_lunch_record"] = create_lunch_order
-globals()["create_lunch_record"] = create_lunch_order
-
