@@ -6895,3 +6895,196 @@ globals()["add_announce"] = create_announce
 globals()["create_announcement"] = create_announce
 globals()["add_lunch_record"] = create_lunch_order
 globals()["create_lunch_record"] = create_lunch_order
+
+
+# =====================================================================
+# ✅ FINAL OVERRIDE (2026-02-15)
+# 目的：把「公告 / 午餐 / 加班設定」寫入流程改成『操作記錄表』同款的
+#      「先用已知 title 欄位建立最小列 → 再逐欄位補寫」策略。
+# 好處：
+#   - 不再依賴 databases.retrieve() 一定要拿到 properties（避免你現在遇到的 empty props）
+#   - DB 欄位對位改成『以欄位名稱為主』，拿不到 schema 也照寫（寫失敗就略過並回報）
+# =====================================================================
+
+from datetime import datetime as _dt
+
+
+def get_db_properties(database_id: str, force_refresh: bool = False):
+    """安全取得 DB properties：拿不到就回傳 {}（絕不 raise）。
+
+    你的操作記錄表之所以一直能寫入，是因為它只需要『title 欄位』就能先建立 page，
+    後續欄位寫不進去也不會阻塞整個建立流程。
+
+    其他表先前會失敗，是因為我們把 properties 空/抓不到視為致命錯誤而直接 return。
+    這裡改回「可用則用、不可用也照寫」。
+    """
+    if not database_id:
+        return {}
+    try:
+        dbid = _normalize_notion_id(database_id) or database_id
+    except Exception:
+        dbid = database_id
+
+    cache = st.session_state.setdefault("_db_props_cache_final", {})
+    if force_refresh:
+        cache.pop(dbid, None)
+    if dbid in cache:
+        return cache[dbid]
+
+    try:
+        res = notion.databases.retrieve(database_id=dbid)
+        props = (res or {}).get("properties", {}) or {}
+        cache[dbid] = props
+        return props
+    except Exception:
+        cache[dbid] = {}
+        return {}
+
+
+def _first_title_prop_name(props_meta: dict) -> str | None:
+    for k, meta in (props_meta or {}).items():
+        if (meta or {}).get("type") == "title":
+            return k
+    return None
+
+
+def _pick_title_name(props_meta: dict, candidates: list[str]) -> str:
+    """優先用候選欄位名稱；沒有就用 schema 找到的第一個 title；再不行就用第一個候選。"""
+    for c in candidates:
+        if c and props_meta and c in props_meta:
+            return c
+    t = _first_title_prop_name(props_meta)
+    return t or (candidates[0] if candidates else "名稱")
+
+
+def _rt(text: str):
+    return [{"text": {"content": text or ""}}]
+
+
+def _safe_date_start2(d: date | datetime | None) -> str | None:
+    if not d:
+        return None
+    if isinstance(d, _dt):
+        return d.isoformat()
+    return _dt.combine(d, _dt.min.time()).isoformat()
+
+
+def _update_try(page_id: str, prop_name: str, value, prefer_types: list[str]):
+    """像操作記錄表一樣：同一個欄位用不同 Notion type payload 試到成功為止。"""
+    for t in prefer_types:
+        if t == "title":
+            ok, _ = _safe_update(page_id, {prop_name: {"title": _rt(str(value or ""))}})
+        elif t == "rich_text":
+            ok, _ = _safe_update(page_id, {prop_name: {"rich_text": _rt(str(value or ""))}})
+        elif t == "number":
+            try:
+                num = float(value or 0)
+            except Exception:
+                num = 0.0
+            ok, _ = _safe_update(page_id, {prop_name: {"number": num}})
+        elif t == "date":
+            start = _safe_date_start2(value)
+            ok, _ = _safe_update(page_id, {prop_name: {"date": {"start": start}}})
+        elif t == "checkbox":
+            ok, _ = _safe_update(page_id, {prop_name: {"checkbox": bool(value)}})
+        elif t == "status":
+            ok, _ = _safe_update(page_id, {prop_name: {"status": {"name": str(value)}}})
+        elif t == "select":
+            ok, _ = _safe_update(page_id, {prop_name: {"select": {"name": str(value)}}})
+        else:
+            continue
+        if ok:
+            return True
+    return False
+
+
+def _create_min_page(database_id: str, title_prop_candidates: list[str], title_text: str):
+    """建立最小可行 page（只寫 title）。這一步成功 = 至少不會再產生『完全空白』以外的錯誤。"""
+    dbid = _normalize_notion_id(database_id) or database_id
+    props_meta = get_db_properties(dbid, force_refresh=False) or {}
+    title_prop = _pick_title_name(props_meta, title_prop_candidates)
+
+    # 不依賴 schema：直接用 title payload 建立
+    created = notion.pages.create(
+        parent={"database_id": dbid},
+        properties={title_prop: {"title": _rt(title_text)}},
+    )
+    return created.get("id"), title_prop
+
+
+# ---------------------------
+# 公告：新增
+# ---------------------------
+
+def create_announcement(publish_date: date, content: str, end_date: date | None, actor: str = "") -> bool:
+    if not ANNOUNCE_DB_ID:
+        st.error("❌ 尚未設定 ANNOUNCE_DB_ID（公告紀錄表 Database ID）")
+        return False
+
+    content = (content or "").strip()
+    if not content:
+        st.error("❌ 公告內容不可為空")
+        return False
+
+    dbid = _normalize_notion_id(ANNOUNCE_DB_ID) or ANNOUNCE_DB_ID
+
+    try:
+        # 1) 先用『內容』當 title（你已經把 title 改成 內容）
+        title_text = _make_title_from_content(content, 3) if "_make_title_from_content" in globals() else (content[:3] or "—")
+        page_id, _ = _create_min_page(dbid, ["內容", "公告內容", "名稱", "Name"], title_text)
+
+        # 2) 再逐欄位補寫（欄位名稱為主；寫不進去就略過）
+        _update_try(page_id, "發布日期", publish_date, ["date"])
+        _update_try(page_id, "公告內容", content, ["rich_text", "title"])
+        if end_date:
+            _update_try(page_id, "結束時間", end_date, ["date"])
+        _update_try(page_id, "完成情況", False, ["checkbox"])
+
+        log_action(actor or "—", "公告管理", f"新增公告：{publish_date.isoformat()}｜{content[:30]}", "成功")
+        return True
+
+    except Exception as e:
+        st.error(f"新增公告失敗：{e}")
+        log_action(actor or "—", "公告管理", f"新增公告失敗：{e}", "系統錯誤")
+        return False
+
+
+# ---------------------------
+# 午餐：新增
+# ---------------------------
+
+def create_lunch_order(employee_name: str, lunch_date: date, amount: float, actor: str = "") -> bool:
+    if not LUNCH_DB_ID:
+        st.error("❌ 尚未設定 LUNCH_DB_ID（午餐訂餐表 Database ID）")
+        return False
+
+    employee_name = (employee_name or "").strip()
+    if not employee_name:
+        st.error("❌ 員工姓名不可為空")
+        return False
+
+    dbid = _normalize_notion_id(LUNCH_DB_ID) or LUNCH_DB_ID
+
+    try:
+        # 1) 先用『員工姓名』建立最小列（你的午餐表 title 就是 員工姓名）
+        page_id, _ = _create_min_page(dbid, ["員工姓名", "姓名", "名稱", "Name"], employee_name)
+
+        # 2) 再補寫金額/日期
+        _update_try(page_id, "訂餐金額", float(amount or 0), ["number"])
+        _update_try(page_id, "訂餐日期", lunch_date, ["date"])
+
+        log_action(actor or employee_name, "午餐訂餐", f"{employee_name}｜{lunch_date.isoformat()}｜${float(amount or 0):.0f}", "成功")
+        return True
+
+    except Exception as e:
+        st.error(f"寫入午餐訂餐失敗：{e}")
+        log_action(actor or employee_name, "午餐訂餐", f"寫入失敗：{e}", "系統錯誤")
+        return False
+
+
+# 舊名稱 alias（避免 UI 找不到）
+globals()["add_announce"] = create_announcement
+globals()["create_announce"] = create_announcement
+globals()["add_lunch_record"] = create_lunch_order
+globals()["create_lunch_record"] = create_lunch_order
+
