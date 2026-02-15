@@ -20,21 +20,48 @@ import re
 load_dotenv()
 
 def _get_cfg(key: str, default=None):
-    """優先讀取 Streamlit Cloud 的 st.secrets，其次讀取環境變數；都沒有則回傳 default。"""
+    """優先讀取 Streamlit Cloud 的 st.secrets，其次讀取環境變數；都沒有則回傳 default。
+    ✅ 兼容：大小寫不同的 key（例如 secrets 用 notion_token / NOTION_TOKEN）
+    """
+    keys_to_try = [key, str(key).upper(), str(key).lower()]
+    # 1) Streamlit Secrets
     try:
-        if hasattr(st, "secrets") and key in st.secrets:
-            return st.secrets[key]
+        if hasattr(st, "secrets"):
+            for k in keys_to_try:
+                if k in st.secrets:
+                    return st.secrets[k]
+                # 有些人會放在 [general] 或其他 section 內（st.secrets 會是 dict-like）
+                try:
+                    v = st.secrets.get(k, None)  # type: ignore[attr-defined]
+                    if v is not None:
+                        return v
+                except Exception:
+                    pass
+            # 掃描一層巢狀（避免 secrets.toml 分段）
+            try:
+                for _, section in dict(st.secrets).items():
+                    if isinstance(section, dict):
+                        for k in keys_to_try:
+                            if k in section:
+                                return section[k]
+            except Exception:
+                pass
     except Exception:
         pass
-    v = os.getenv(key)
-    return v if v is not None else default
+
+    # 2) Environment Variables
+    for k in keys_to_try:
+        v = os.getenv(k)
+        if v is not None:
+            return v
+    return default
 
 NOTION_TOKEN = _get_cfg("NOTION_TOKEN")
 ACCOUNT_DB_ID = _get_cfg("ACCOUNT_DB_ID")
 LEAVE_DB_ID = _get_cfg("LEAVE_DB_ID")
 VACATION_DB_ID = _get_cfg("VACATION_DB_ID")
 SALARY_DB_ID = _get_cfg("SALARY_DB_ID")  # ✅ 薪資計算表
-OPLOG_DB_ID = _get_cfg("OPLOG_DB_ID")    # ✅ 操作記錄表
+OPLOG_DB_ID = _get_cfg("OPLOG_DB_ID") or _get_cfg("OP_LOG_DB_ID") or _get_cfg("OPERATION_LOG_DB_ID")  # ✅ 操作記錄表
 CASHOUT_RULE_DB_ID = _get_cfg("CASHOUT_RULE_DB_ID")
 ANNOUNCE_DB_ID = _get_cfg("ANNOUNCE_DB_ID")  # ✅ 公告紀錄表
 PUNCH_DB_ID = _get_cfg("PUNCH_DB_ID")
@@ -68,6 +95,163 @@ if not SALARY_DB_ID:
     raise RuntimeError("❌ 請先在 .env 設定 SALARY_DB_ID（薪資計算表 Database ID）")
 
 notion = Client(auth=NOTION_TOKEN)
+
+# =========================
+# 🔧 Notion `databases.query` 相容修復
+# 有些部署環境會出現 `DatabasesEndpoint` 沒有 `query` 方法，導致「查無帳號」
+# 這裡提供 fallback：直接用 Notion REST API 呼叫 /databases/{db_id}/query
+# =========================
+
+def _notion_rest_db_query(database_id: str, payload: dict) -> dict:
+    import requests
+
+    token = NOTION_TOKEN
+    if not token:
+        raise RuntimeError("❌ NOTION_TOKEN 未設定，無法查詢 Notion Database")
+
+    notion_version = os.getenv("NOTION_VERSION", "2022-06-28")
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Notion-Version": notion_version,
+        "Content-Type": "application/json",
+    }
+    url = f"https://api.notion.com/v1/databases/{database_id}/query"
+    resp = requests.post(url, headers=headers, json=payload, timeout=20)
+    resp.raise_for_status()
+    return resp.json()
+
+# 若 notion.databases.query 不存在，動態補上
+if not hasattr(notion.databases, "query"):
+    def _compat_databases_query(*, database_id: str, **kwargs):
+        payload = dict(kwargs) if kwargs else {}
+        return _notion_rest_db_query(database_id, payload)
+
+    try:
+        setattr(notion.databases, "query", _compat_databases_query)
+    except Exception:
+        # 若無法 setattr，就維持原狀；後續會在 debug 中顯示錯誤
+        pass
+
+
+# =========================
+# 🛠 部署端 Debug（可在「尚未登入」時使用）
+# 開啟方式：
+# 1) 網址加 ?debug=1
+# 2) Secrets / 環境變數：DEPLOY_DEBUG=1
+# 3) 登入頁面的「🛠 部署 Debug」展開後勾選
+# =========================
+def _get_query_param(name: str) -> str | None:
+    try:
+        # Streamlit >= 1.30
+        qp = getattr(st, "query_params", None)
+        if qp is not None:
+            v = qp.get(name)
+            if isinstance(v, list):
+                return v[0] if v else None
+            return v
+    except Exception:
+        pass
+    try:
+        qp = st.experimental_get_query_params()
+        v = qp.get(name)
+        if isinstance(v, list):
+            return v[0] if v else None
+        return v
+    except Exception:
+        return None
+
+def is_deploy_debug_enabled() -> bool:
+    # UI toggle（存在 session_state 就以它為主）
+    if "__deploy_debug" in st.session_state:
+        return bool(st.session_state.get("__deploy_debug"))
+    # URL
+    v = _get_query_param("debug")
+    if v is not None and str(v).strip() in ("1", "true", "True", "YES", "yes"):
+        return True
+    # Secrets / Env
+    v2 = _get_cfg("DEPLOY_DEBUG") or _get_cfg("DEBUG_NOTION") or os.getenv("DEPLOY_DEBUG") or os.getenv("DEBUG_NOTION")
+    if v2 is not None and str(v2).strip() in ("1", "true", "True", "YES", "yes"):
+        return True
+    return False
+
+
+def _dbg_safe_id(s: str, head: int = 6, tail: int = 4) -> str:
+    """Mask IDs/secrets for debug display."""
+    s = str(s or "")
+    if not s:
+        return ""
+    if len(s) <= head + tail:
+        return s
+    return f"{s[:head]}...{s[-tail:]}"
+
+
+def _debug_notion_account_probe(username: str) -> dict:
+    """Probe ACCOUNT_DB schema and the user's row (safe, masked) for deploy debugging."""
+    out: dict = {
+        "ACCOUNT_DB_ID": _dbg_safe_id(ACCOUNT_DB_ID),
+        "LOG_DB_ID": _dbg_safe_id(LOG_DB_ID) if 'LOG_DB_ID' in globals() else "",
+        "username": (username or "").strip(),
+    }
+    try:
+        out["bcrypt_version"] = getattr(bcrypt, "__version__", "unknown")
+    except Exception:
+        out["bcrypt_version"] = "unknown"
+
+    # DB title + prop types
+    try:
+        db = notion.databases.retrieve(database_id=ACCOUNT_DB_ID)
+        out["account_db_title"] = "".join([(x.get("plain_text") or "") for x in (db.get("title") or [])]).strip()
+        props = (db.get("properties", {}) or {}) if isinstance(db, dict) else {}
+        out["account_db_props"] = {k: (v.get("type") if isinstance(v, dict) else None) for k, v in props.items()}
+    except Exception as e:
+        out["account_db_retrieve_error"] = str(e)
+
+    uname = out["username"]
+    if uname:
+        tries = []
+        for ftype, flt in [
+            ("title.equals", {"property": "員工姓名", "title": {"equals": uname}}),
+            ("rich_text.equals", {"property": "員工姓名", "rich_text": {"equals": uname}}),
+        ]:
+            try:
+                res = notion.databases.query(database_id=ACCOUNT_DB_ID, filter=flt, page_size=5)
+                rows = res.get("results", []) if isinstance(res, dict) else []
+                item = {"filter": ftype, "count": len(rows), "page_id": _dbg_safe_id(rows[0].get("id")) if rows else ""}
+                if rows:
+                    p = (rows[0].get("properties", {}) or {})
+                    lh = _get_prop_plain_text(p.get("login_hash", {}))
+                    lp = _get_prop_plain_text(p.get("密碼", {}))
+                    item.update({
+                        "has_login_hash": bool(lh),
+                        "login_hash_len": len(lh) if lh else 0,
+                        "login_hash_prefix": (re.sub(r"\s+", "", lh)[:12] if lh else ""),
+                        "has_legacy_pwd": bool(lp),
+                        "legacy_pwd_len": len(lp) if lp else 0,
+                        "role": ((p.get("權限", {}) or {}).get("select") or {}).get("name"),
+                    })
+                tries.append(item)
+            except Exception as e:
+                tries.append({"filter": ftype, "error": str(e)})
+        out["account_query"] = tries
+
+    return out
+
+
+def _mask(s: str, head: int = 10, tail: int = 6) -> str:
+    s = s or ""
+    if len(s) <= head + tail:
+        return s
+    return f"{s[:head]}...{s[-tail:]}"
+
+def deploy_debug_note(msg: str):
+    # 同時印到 logs 與畫面（畫面只有在 debug 開啟時顯示）
+    try:
+        print(f"[DEPLOY_DEBUG] {msg}")
+    except Exception:
+        pass
+    if is_deploy_debug_enabled():
+        st.caption(f"🛠 {msg}")
+
 
 # =========================
 # ✅ 表格欄位清理（員工視角不顯示建立/更新時間）
@@ -119,28 +303,36 @@ def _rt_get_first_plain_text(prop: dict) -> str:
 
 
 def _get_prop_plain_text(prop: dict) -> str:
-    """更通用的 Notion 文字讀取：支援 title / rich_text / select / multi_select / number / checkbox."""
+    """更通用的 Notion 文字讀取：
+    - title / rich_text：把所有分段 plain_text 串起來（重要：bcrypt hash 常被切段）
+    - select / multi_select / number / checkbox：轉成字串
+    """
     if not prop:
         return ""
-    # title / rich_text
+
+    # title / rich_text：Notion 可能會把長字串切段，必須合併
     if "title" in prop:
         arr = prop.get("title") or []
-        return (arr[0].get("plain_text") or "").strip() if arr else ""
+        return "".join([(x.get("plain_text") or "") for x in arr]).strip()
     if "rich_text" in prop:
         arr = prop.get("rich_text") or []
-        return (arr[0].get("plain_text") or "").strip() if arr else ""
+        return "".join([(x.get("plain_text") or "") for x in arr]).strip()
+
     # select / multi_select
     if "select" in prop and prop.get("select"):
         return (prop["select"].get("name") or "").strip()
-    if "multi_select" in prop and prop.get("multi_select"):
+    if "multi_select" in prop and prop.get("multi_select") is not None:
         ms = prop.get("multi_select") or []
-        return ", ".join([(x.get("name") or "").strip() for x in ms if x.get("name")])
+        return ", ".join([(x.get("name") or "").strip() for x in ms if (x.get("name") or "").strip()])
+
     # number / checkbox
     if "number" in prop and prop.get("number") is not None:
         return str(prop.get("number"))
     if "checkbox" in prop and prop.get("checkbox") is not None:
         return "True" if prop.get("checkbox") else "False"
+
     return ""
+
 
 def _build_notion_prop_value(db_id: str, props_meta: dict, prop_name: str, value):
     """依據資料庫欄位型態，自動組出 Notion API properties payload；不匹配就回傳 None（略過該欄位）。"""
@@ -214,82 +406,57 @@ def verify_password_bcrypt(plain: str, hashed: str) -> bool:
     if not plain or not hashed:
         return False
     try:
-        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+        # ✅ Notion 的 rich_text / title 有時會把長字串切段或夾雜換行、空白
+        #    雲端部署時最常見的就是 login_hash 讀出來含有 \n / 空白，導致 bcrypt 驗證永遠失敗
+        cleaned = re.sub(r"\s+", "", str(hashed))
+        return bcrypt.checkpw(plain.encode("utf-8"), cleaned.encode("utf-8"))
     except Exception:
         return False
 
 
 def get_account_page_by_username(username: str) -> dict | None:
-    """用員工姓名找帳號管理表那一筆 page（自動適配 title / rich_text）"""
+    """用員工姓名找帳號管理表那一筆 page（不依賴 schema；依序嘗試 title / rich_text）"""
     username = (username or "").strip()
     if not username:
         return None
 
+    # ✅ 雲端偶爾會因為 schema 讀取失敗而導致查不到帳號（進而「帳號或密碼錯誤」）
+    #   這裡改成「不依賴 notion.databases.retrieve」，直接嘗試兩種常見型態的 filter。
     try:
-        props = get_db_properties(ACCOUNT_DB_ID) or {}
-        p = props.get("員工姓名", {}) or {}
-        ptype = p.get("type")
-
-        if ptype == "title":
-            flt = {"property": "員工姓名", "title": {"equals": username}}
-        elif ptype == "rich_text":
-            flt = {"property": "員工姓名", "rich_text": {"equals": username}}
-        else:
-            # 找不到欄位或型態不是文字 → 直接查不到
-            return None
-
         res = notion.databases.query(
             database_id=ACCOUNT_DB_ID,
-            filter=flt,
+            filter={"property": "員工姓名", "title": {"equals": username}},
+            page_size=1,
+        )
+        results = res.get("results", [])
+        if results:
+            return results[0]
+    except Exception:
+        pass
+
+    try:
+        res = notion.databases.query(
+            database_id=ACCOUNT_DB_ID,
+            filter={"property": "員工姓名", "rich_text": {"equals": username}},
             page_size=1,
         )
         results = res.get("results", [])
         return results[0] if results else None
-
     except Exception:
         return None
 
-
 @st.cache_data(ttl=60)
-def _normalize_notion_id(raw: str | None) -> str:
-    """Extract a 32-hex Notion ID from raw (may be a URL / contains ?v=...)."""
-    s = str(raw or "").strip()
-    if not s:
-        return ""
-    # pull the first 32-hex chunk (database_id/page_id)
-    m = re.search(r"([0-9a-fA-F]{32})", s)
-    if m:
-        return m.group(1).lower()
-    # accept dashed uuid
-    m = re.search(r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})", s)
-    if m:
-        return m.group(1).replace("-", "").lower()
-    return s
-
-
-def get_db_properties(database_id: str, *, force_refresh: bool = False) -> dict:
-    """Return Notion database properties mapping.
-
-    Note: If this DB was previously not shared to the integration, Notion will return 404.
-    In deploy, we may have cached/kept an empty dict. Setting force_refresh=True ensures
-    we re-fetch and do not silently keep empty data.
-    """
-    dbid = _normalize_notion_id(database_id)
-    if not dbid:
-        return {}
+def get_db_properties(database_id: str) -> dict:
     try:
-        # We don't rely on Streamlit caching here for critical schema reads.
-        db = notion.databases.retrieve(database_id=dbid)
-        props = (db or {}).get("properties", {}) or {}
-        return props
+        db = notion.databases.retrieve(database_id=database_id)
+        return db.get("properties", {}) or {}
     except Exception as e:
-        # do NOT raise here (many screens probe schemas); caller can decide.
-        # keep the error string for debug if enabled.
-        if st.session_state.get("__deploy_debug_on") or (str(st.query_params.get("debug", "")) == "1"):
-            st.session_state.setdefault("__deploy_debug_errors", []).append(
-                {"kind": "db_properties", "dbid": dbid, "error": repr(e)}
-            )
+        # ✅ 佈署到 Streamlit Cloud 時，如果 secrets/token/權限或 DB_ID 有問題，這裡會失敗
+        #    開啟 DEBUG_NOTION=1 才顯示錯誤，避免一般使用者看到內部訊息
+        if os.getenv("DEBUG_NOTION", "").strip() == "1":
+            st.error(f"❌ Notion 讀取資料庫欄位失敗（{database_id}）：{e}")
         return {}
+
 
 
 @st.cache_data(ttl=60)
@@ -2057,44 +2224,71 @@ def resolve_salary_food_prop_name() -> str | None:
 # ✅ 操作記錄表：寫入 / 讀取
 # =========================
 def log_action(employee_name: str, action_type: str, action_content: str, result: str):
-    """寫入「操作記錄表」：不強制欄位型態，盡力填入可用欄位。
-    ✅ 重點：
-    - 永遠會寫入「title 欄位」（不管它叫什麼），避免雲端只出現空白列
-    - 其他欄位（員工姓名/操作類型/操作內容/操作結果/操作時間）依資料庫實際型態自動適配
+    """寫入「操作記錄表」(Operation Log)
+
+    你的「操作時間」是 Notion 的「建立時間(created_time)」欄位，所以它會自動出現；
+    目前只寫入了「員工姓名(title)」，原因通常是「抓不到 DB schema → props_meta 為空」導致只走最安全的 title 寫入。
+
+    這裡改成：先用 title 建立一筆(必成功)，再用 pages.update 逐欄位補寫
+    （逐欄位寫，避免某一欄型態不吻合導致整次 update 失敗）。
     """
     if not OPLOG_DB_ID:
         return
 
-    employee_name = (employee_name or "").strip()
-    action_type = (action_type or "").strip()
-    action_content = (action_content or "").strip()
-    result = (result or "").strip()
+    emp = (employee_name or "").strip() or "—"
+    act = (action_type or "").strip() or "—"
+    content = (action_content or "").strip() or "—"
+    res_txt = (result or "").strip() or "—"
+
+    def _debug_enabled() -> bool:
+        return str(os.getenv("DEPLOY_DEBUG", "")).strip() == "1" or str(os.getenv("DEBUG_NOTION", "")).strip() == "1"
+
+    def _safe_update(page_id: str, props: dict):
+        try:
+            notion.pages.update(page_id=page_id, properties=props)
+            return True, None
+        except Exception as e:
+            return False, e
 
     try:
+        # 1) 先建立最小可行列：只寫 title（Notion DB 一定有 title）
         props_meta = get_db_properties(OPLOG_DB_ID) or {}
-        props: dict = {}
+        title_prop = _first_title_prop_name(props_meta) or "員工姓名"
 
-        # 1) 一定要填 title 欄位（Notion DB 必有）
-        title_prop = _first_title_prop_name(props_meta)
-        if title_prop:
-            # 優先用員工姓名，沒有就用操作類型/內容當 title
-            title_value = employee_name or action_type or action_content or "—"
-            props[title_prop] = {"title": [{"text": {"content": str(title_value)}}]}
+        create_props = {
+            title_prop: {"title": [{"text": {"content": emp or "—"}}]}
+        }
 
-        # 2) 其他欄位：依實際型態盡力寫入（不存在就略過）
-        _best_set_text(props, props_meta, "員工姓名", employee_name or "—")
-        _best_set_text(props, props_meta, "操作類型", action_type)
-        _best_set_text(props, props_meta, "操作內容", action_content)
-        _best_set_select(props, props_meta, OPLOG_DB_ID, "操作結果", result)
+        created = notion.pages.create(parent={"database_id": OPLOG_DB_ID}, properties=create_props)
+        page_id = created.get("id")
 
-        # 3) 操作時間：如果你的欄位是 date，才手動寫入；若是 created_time 則 Notion 會自動填
-        if "操作時間" in props_meta:
-            p_type = (props_meta.get("操作時間", {}) or {}).get("type")
-            if p_type == "date":
-                props["操作時間"] = {"date": {"start": datetime.now().isoformat()}}
+        if not page_id:
+            # 理論上不會發生，但保底
+            if _debug_enabled():
+                st.error("❌ 操作記錄建立成功但拿不到 page_id（無法補寫欄位）")
+            return
 
-        notion.pages.create(parent={"database_id": OPLOG_DB_ID}, properties=props)
-    except Exception:
+        # 2) 逐欄位補寫（即使抓不到 schema 也照寫；寫失敗就略過）
+        # 2-1) 操作類型：先試 status，再試 select，再試 rich_text
+        ok, err = _safe_update(page_id, {"操作類型": {"status": {"name": act}}})
+        if not ok:
+            ok, err = _safe_update(page_id, {"操作類型": {"select": {"name": act}}})
+        if not ok:
+            ok, err = _safe_update(page_id, {"操作類型": {"rich_text": [{"text": {"content": act}}]}})
+
+        # 2-2) 操作內容：rich_text
+        _safe_update(page_id, {"操作內容": {"rich_text": [{"text": {"content": content}}]}})
+
+        # 2-3) 操作結果：先試 status，再試 select，再試 rich_text
+        ok, err = _safe_update(page_id, {"操作結果": {"status": {"name": res_txt}}})
+        if not ok:
+            ok, err = _safe_update(page_id, {"操作結果": {"select": {"name": res_txt}}})
+        if not ok:
+            _safe_update(page_id, {"操作結果": {"rich_text": [{"text": {"content": res_txt}}]}})
+
+    except Exception as e:
+        if str(os.getenv("DEBUG_NOTION", "")).strip() == "1":
+            st.error(f"❌ 寫入操作記錄失敗：{e}")
         return
 
 
@@ -2274,13 +2468,21 @@ def login(username: str, password: str):
     username = (username or "").strip()
     password = (password or "").strip()
 
+    # Debug：每次嘗試登入先清空上一次資訊
+    if is_deploy_debug_enabled():
+        st.session_state["__debug_login"] = {}
+
     if not username or not password:
+        if is_deploy_debug_enabled():
+            st.session_state["__debug_login"].update({"stage": "empty_credentials", "probe": _debug_notion_account_probe(username)})
         log_action(username or "—", "登入", "帳號或密碼為空", "失敗")
         return False, False, False
 
     try:
         page = get_account_page_by_username(username)
         if not page:
+            if is_deploy_debug_enabled():
+                st.session_state["__debug_login"].update({"stage": "account_not_found", "probe": _debug_notion_account_probe(username)})
             log_action(username, "登入", "找不到帳號", "失敗")
             return False, False, False
 
@@ -2291,9 +2493,27 @@ def login(username: str, password: str):
         role = sel.get("name") if sel else None
         is_admin = (role == "管理員")
 
+        if is_deploy_debug_enabled():
+            st.session_state["__debug_login"].update({
+                "username": username,
+                "found_page": True,
+                "role": role,
+                "is_admin": is_admin,
+            })
+
         login_hash = _get_prop_plain_text(props.get("login_hash", {}))
         legacy_pwd = _get_prop_plain_text(props.get("密碼", {}))
         must_change_flag = bool((props.get("must_change_password", {}) or {}).get("checkbox") or False)
+
+        if is_deploy_debug_enabled():
+            st.session_state["__debug_login"].update({
+                "has_login_hash": bool(login_hash),
+                "login_hash_len": len(login_hash) if login_hash else 0,
+                "login_hash_mask": _mask(login_hash, 12, 8) if login_hash else "",
+                "has_legacy_pwd": bool(legacy_pwd),
+                "legacy_pwd_len": len(legacy_pwd) if legacy_pwd else 0,
+                "must_change_flag": must_change_flag,
+            })
 
         used_legacy = False
 
@@ -2303,7 +2523,16 @@ def login(username: str, password: str):
             ok = (password == legacy_pwd)
             used_legacy = bool(ok)
 
+        if is_deploy_debug_enabled():
+            st.session_state["__debug_login"].update({
+                "used_legacy": used_legacy,
+                "bcrypt_ok": bool(ok) if login_hash else None,
+                "legacy_ok": bool(ok) if (not login_hash) else None,
+            })
+
         if not ok:
+            if is_deploy_debug_enabled():
+                st.session_state["__debug_login"].update({"stage": "verify_failed", "probe": _debug_notion_account_probe(username)})
             log_action(username, "登入", "帳號或密碼錯誤", "失敗")
             return False, False, False
 
@@ -4311,29 +4540,29 @@ if not st.session_state["logged_in"]:
             font-size: 26px;
             font-weight: 800;
             margin: 6px 0 18px 0;
-            color: rgba(55, 62, 120, 0.92);  #文字顏色
-            letter-spacing: 0.3px;
-        }
-
-        /* inputs */
-        div[data-testid="stForm"] label {
-            font-weight: 700 !important;
-            color: rgba(20, 35, 55, 0.86) !important;
-        }
-        div[data-testid="stForm"] .stTextInput > div > div > input {
-            height: 48px !important;
-            border-radius: 12px !important;
-            background: rgba(235, 246, 255, 0.55) !important;
-            border: 1px solid rgba(0, 90, 150, 0.18) !important;
-            box-shadow: inset 0 1px 0 rgba(255,255,255,0.55);
-        }
-        div[data-testid="stForm"] .stTextInput > div > div > input:focus {
-            border-color: rgba(0, 90, 150, 0.48) !important;
-            box-shadow: 0 0 0 4px rgba(0, 90, 150, 0.16) !important;
-        }
-
-        /* submit button */
-        div[data-testid="stForm"] .stButton > button,
+                    color: rgba(55, 62, 120, 0.92);  #文字顏色
+                    letter-spacing: 0.3px;
+                }
+        
+                /* inputs */
+                div[data-testid="stForm"] label {
+                    font-weight: 700 !important;
+                    color: rgba(20, 35, 55, 0.86) !important;
+                }
+                div[data-testid="stForm"] .stTextInput > div > div > input {
+                    height: 48px !important;
+                    border-radius: 12px !important;
+                    background: rgba(235, 246, 255, 0.55) !important;
+                    border: 1px solid rgba(0, 90, 150, 0.18) !important;
+                    box-shadow: inset 0 1px 0 rgba(255,255,255,0.55);
+                }
+                div[data-testid="stForm"] .stTextInput > div > div > input:focus {
+                    border-color: rgba(0, 90, 150, 0.48) !important;
+                    box-shadow: 0 0 0 4px rgba(0, 90, 150, 0.16) !important;
+                }
+        
+                /* submit button */
+                div[data-testid="stForm"] .stButton > button,
         div[data-testid="stForm"] .stFormSubmitButton > button {
             width: 100% !important;
             height: 54px !important;
@@ -4360,6 +4589,15 @@ if not st.session_state["logged_in"]:
     # ✅ 版面置中（不影響其他頁）
     pad1, center, pad2 = st.columns([1, 1.2, 1])
     with center:
+        # 🛠 部署 Debug：尚未登入也能開啟
+        with st.expander("🛠 部署 Debug（尚未登入也可用）", expanded=is_deploy_debug_enabled()):
+            _ui_default = is_deploy_debug_enabled()
+            st.session_state["__deploy_debug"] = st.checkbox("開啟 Debug", value=_ui_default, key="__deploy_debug_cb")
+            if st.session_state.get("__debug_login"):
+                st.write("🔎 Debug / login()")
+                st.json(st.session_state.get("__debug_login"))
+            st.caption("開啟方式：?debug=1 或 Secrets/Env：DEPLOY_DEBUG=1")
+
         # ✅ 把登入區改成 st.form：外框就是表單容器，所以「一定會被包在卡片裡」
         with st.form("login_form", clear_on_submit=False):
             st.markdown('<div class="login-icon"><span>🔐</span></div>', unsafe_allow_html=True)
