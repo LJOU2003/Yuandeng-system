@@ -1009,8 +1009,14 @@ def _make_announce_title(content: str, pub_date: date) -> str:
 
 
 def create_announcement(publish_date: date, content: str, end_date: date | None, actor: str = "") -> bool:
+    """新增公告到 Notion（公告紀錄表）。
+
+    ✅ 依「欄位名稱」對位（不靠 type 推斷），避免一直卡在 Title 欄位判斷。
+    ⚠️ Notion DB 一定會有一個「Title」型態欄位，但它的『名稱』可能是「內容 / 名稱 / 員工姓名...」，
+       所以這裡優先用你表格上看得到的欄位名稱去對位。
+    """
     if not ANNOUNCE_DB_ID:
-        st.error("❌ 尚未設定 ANNOUNCE_DB_ID")
+        st.error("❌ 尚未設定 ANNOUNCE_DB_ID（公告紀錄表 Database ID）")
         return False
 
     content = (content or "").strip()
@@ -1018,62 +1024,68 @@ def create_announcement(publish_date: date, content: str, end_date: date | None,
         st.error("❌ 公告內容不可為空")
         return False
 
-    # 1. 嘗試抓 Schema
-    props_meta = get_db_properties(ANNOUNCE_DB_ID, force_refresh=True) or {}
-
-    # 2. 設定預設欄位名稱 (暴力預設)
-    # 通常 Notion 預設 Title 叫 "Name" 或 "標題"，但你的截圖沒顯示欄位名
-    # 我們先假設 Title 欄位叫 "標題" 或 "公告標題"
-    # ⚠️ 請去 Notion 確認公告表的第一個欄位叫什麼名字，填在下面
-    target_title_col = "標題"  # <--- 請確認這個
-    target_content_col = "公告內容"
-    target_pub_col = "發布日期"
-    target_end_col = "結束時間"
-    target_done_col = "完成情況"
-
-    # 3. 如果抓得到 Schema，自動校正
-    if props_meta:
-        for name, meta in props_meta.items():
-            t = meta.get("type")
-            if t == "title":
-                target_title_col = name
-            elif t == "rich_text" and ("內容" in name):
-                target_content_col = name
-            elif t == "date" and ("發布" in name or "發佈" in name):
-                target_pub_col = name
-            elif t == "date" and ("結束" in name):
-                target_end_col = name
-            elif t == "checkbox":
-                target_done_col = name
-
-    # 4. 組裝
-    props = {}
-    
-    # Title (必填) - 用內容前3個字當標題
-    title_text = content[:3]
-    props[target_title_col] = {"title": [{"text": {"content": title_text}}]}
-
-    # 內容 (Rich Text)
-    props[target_content_col] = {"rich_text": [{"text": {"content": content}}]}
-
-    # 發布日期
-    props[target_pub_col] = {"date": {"start": datetime.combine(publish_date, datetime.min.time()).isoformat()}}
-
-    # 結束日期
-    if end_date:
-        props[target_end_col] = {"date": {"start": datetime.combine(end_date, datetime.min.time()).isoformat()}}
-        
-    # 完成情況
-    props[target_done_col] = {"checkbox": False}
-
     try:
-        notion.pages.create(parent={"database_id": ANNOUNCE_DB_ID}, properties=props)
-        log_action(actor or "—", "公告管理", f"新增公告：{publish_date.isoformat()}", "成功")
-        return True
-    except Exception as e:
-        st.error(f"公告新增失敗 (請確認欄位 '{target_title_col}' 是否存在): {e}")
-        return False
+        meta = get_db_properties(ANNOUNCE_DB_ID, force_refresh=True) or {}
 
+        def has(name: str) -> bool:
+            return name in meta
+
+        # 你把 Title 欄位改名成「內容」：就用它當 Title（只放前三字，避免太長）
+        title_text = (content.replace("\n", " ").replace("\r", " ").strip()[:3] or "公告").strip()
+        props: dict = {}
+
+        # Title 欄位：只靠「欄位名稱」對位
+        # - 優先用「內容」（你目前的 Title 欄位名）
+        # - 其次用「名稱」「標題」「公告標題」
+        if has("內容"):
+            props["內容"] = {"title": [{"text": {"content": title_text}}]}
+        elif has("名稱"):
+            props["名稱"] = {"title": [{"text": {"content": title_text}}]}
+        elif has("標題"):
+            props["標題"] = {"title": [{"text": {"content": title_text}}]}
+        elif has("公告標題"):
+            props["公告標題"] = {"title": [{"text": {"content": title_text}}]}
+        else:
+            # 如果你 Title 欄位不是上述名字：就用第一個「看起來像 Title 欄位名稱」的候選
+            # （仍然是用欄位『名稱』做比對，不用 type=title）
+            for cand in ["Name", "Title", "主欄位", "頁面名稱"]:
+                if has(cand):
+                    props[cand] = {"title": [{"text": {"content": title_text}}]}
+                    break
+
+        # 公告內容：依欄位名稱（rich_text）
+        if has("公告內容"):
+            props["公告內容"] = {"rich_text": [{"text": {"content": content}}]}
+        # 你若沒有「公告內容」欄位，且 Title 已經用「內容」承載了前三字，
+        # 仍希望完整內容寫進同名欄位（如果它本身不是 title）
+        elif has("內容") and (meta.get("內容") or {}).get("type") == "rich_text":
+            props["內容"] = {"rich_text": [{"text": {"content": content}}]}
+
+        # 發布日期 / 結束時間 / 完成情況
+        if has("發布日期"):
+            props["發布日期"] = {"date": {"start": datetime.combine(publish_date, datetime.min.time()).isoformat()}}
+        elif has("發佈日期"):
+            props["發佈日期"] = {"date": {"start": datetime.combine(publish_date, datetime.min.time()).isoformat()}}
+
+        if end_date:
+            if has("結束時間"):
+                props["結束時間"] = {"date": {"start": datetime.combine(end_date, datetime.min.time()).isoformat()}}
+            elif has("結束日期"):
+                props["結束日期"] = {"date": {"start": datetime.combine(end_date, datetime.min.time()).isoformat()}}
+
+        if has("完成情況"):
+            props["完成情況"] = {"checkbox": False}
+        elif has("完成狀態"):
+            props["完成狀態"] = {"checkbox": False}
+
+        notion.pages.create(parent={"database_id": ANNOUNCE_DB_ID}, properties=props)
+        log_action(actor or "—", "公告管理", f"新增公告：{publish_date.isoformat()}｜{content[:30]}", "成功")
+        return True
+
+    except Exception as e:
+        st.error(f"新增公告失敗：{e}")
+        log_action(actor or "—", "公告管理", f"新增公告失敗：{e}", "系統錯誤")
+        return False
 
 def mark_announcement_done(page_id: str, done: bool, actor: str = "") -> bool:
     if not ANNOUNCE_DB_ID:
@@ -2060,117 +2072,72 @@ def upsert_overtime_rule_to_notion(
     hourly_rate: float,
     note: str = "",
 ) -> str:
-    """同年同月：有就更新，沒有就新增（加班設定表）。回傳 page_id。"""
+    """同年同月：有就更新，沒有就新增（加班設定表）。回傳 page_id。
+
+    ✅ 依欄位『名稱』對位（不靠 type=title 判斷），避免一直卡在「找不到 Title 欄位」。
+    你畫面上的欄位是：
+      - 年份、月份、名稱(YYYY-MM)、班次換算時數、加班時薪、備註
+    """
     if not OVERTIME_RULE_DB_ID:
         raise RuntimeError("尚未設定 OVERTIME_RULE_DB_ID（加班設定表 DB ID）")
 
-    dbid = _normalize_notion_id(OVERTIME_RULE_DB_ID) or OVERTIME_RULE_DB_ID
-    if not dbid:
-        raise RuntimeError("OVERTIME_RULE_DB_ID 格式不正確（無法解析 Notion DB ID）")
+    meta = get_db_properties(OVERTIME_RULE_DB_ID, force_refresh=True) or {}
 
-    # 讀 DB schema（避免欄位型別不一致/欄位名不同）
-    props = get_db_properties(dbid, force_refresh=True) or {}
+    def has(name: str) -> bool:
+        return name in meta
 
-    # 取得 title 欄位名稱（Notion DB 一定有 type=title）
-    title_prop = None
-    for k, v in props.items():
-        if (v or {}).get("type") == "title":
-            title_prop = k
-            break
+    name_text = f"{int(y)}-{int(m):02d}"
 
-    if not title_prop:
-        raise RuntimeError(
-            "找不到加班設定表的 Title 欄位（type=title）。"
-            "（Notion API 回傳空/或 Integration 未共享）"
-        )
+    props: dict = {}
 
-    def _ptype(name: str) -> str | None:
-        return (props.get(name) or {}).get("type")
+    # Title 欄位：你的畫面叫「名稱」
+    if has("名稱"):
+        props["名稱"] = {"title": [{"text": {"content": name_text}}]}
+    else:
+        # 兼容可能命名
+        for cand in ["Name", "Title", "內容"]:
+            if has(cand):
+                props[cand] = {"title": [{"text": {"content": name_text}}]}
+                break
 
-    def _rt(val: str):
-        return {"rich_text": [{"text": {"content": str(val)}}]}
+    if has("年份"):
+        props["年份"] = {"number": int(y)}
+    if has("月份"):
+        props["月份"] = {"number": int(m)}
 
-    def _title(val: str):
-        return {"title": [{"text": {"content": str(val)}}]}
+    if has("班次換算時數（1 次 = 幾小時）"):
+        props["班次換算時數（1 次 = 幾小時）"] = {"number": float(shift_hours or 0)}
+    elif has("班次換算時數"):
+        props["班次換算時數"] = {"number": float(shift_hours or 0)}
 
-    def _num(val):
-        try:
-            return {"number": float(val)}
-        except Exception:
-            return {"number": None}
+    if has("加班時薪"):
+        props["加班時薪"] = {"number": float(hourly_rate or 0)}
 
-    def _sel(val: str):
-        return {"select": {"name": str(val)}} if str(val).strip() else {"select": None}
+    if has("備註"):
+        props["備註"] = {"rich_text": [{"text": {"content": (note or '').strip()}}]}
 
-    def _date_iso(d: str):
-        return {"date": {"start": d}} if str(d).strip() else {"date": None}
+    # 查同年同月是否已存在
+    existing = None
+    try:
+        # 以「名稱=YYYY-MM」為主鍵最穩
+        if has("名稱"):
+            res = notion.databases.query(
+                database_id=OVERTIME_RULE_DB_ID,
+                page_size=10,
+                filter={"property": "名稱", "title": {"equals": name_text}},
+            )
+            r = (res or {}).get("results") or []
+            if r:
+                existing = r[0].get("id")
+    except Exception:
+        existing = None
 
-    def _set(name: str, value):
-        t = _ptype(name)
-        if t == "title":
-            return _title(value)
-        if t == "number":
-            return _num(value)
-        if t == "rich_text":
-            return _rt(value)
-        if t == "select":
-            return _sel(value)
-        if t == "date":
-            return _date_iso(value)
-        # fallback: try rich_text
-        return _rt(value)
+    if existing:
+        notion.pages.update(page_id=existing, properties=props)
+        return existing
 
-    def _pick(*candidates: str) -> str | None:
-        for c in candidates:
-            if c in props:
-                return c
-        return None
-
-    year_prop = _pick("年份", "年", "Year")
-    month_prop = _pick("月份", "月", "Month")
-    shift_prop = _pick("班次換算時數", "班次換算", "換算時數", "ShiftHours")
-    rate_prop = _pick("加班時薪", "時薪", "加班薪資", "HourlyRate")
-    note_prop = _pick("備註", "備註說明", "Note")
-
-    # 名稱（顯示用，若 DB 沒有該欄位就只寫 title）
-    name_value = f"{int(y)}-{int(m):02d}"
-
-    payload: dict = {}
-    payload[title_prop] = _set(title_prop, name_value)
-
-    if year_prop:
-        payload[year_prop] = _set(year_prop, int(y))
-    if month_prop:
-        payload[month_prop] = _set(month_prop, int(m))
-    if shift_prop:
-        payload[shift_prop] = _set(shift_prop, float(shift_hours))
-    if rate_prop:
-        payload[rate_prop] = _set(rate_prop, float(hourly_rate))
-    if note_prop:
-        payload[note_prop] = _set(note_prop, note or "")
-
-    # 查詢同年同月既有 page
-    res = notion.databases.query(
-        database_id=dbid,
-        page_size=1,
-        filter={
-            "and": [
-                {"property": year_prop or "年份", "number": {"equals": int(y)}},
-                {"property": month_prop or "月份", "number": {"equals": int(m)}},
-            ]
-        },
-    )
-    results = (res or {}).get("results", []) or []
-    if results:
-        page_id = results[0]["id"]
-        notion.pages.update(page_id=page_id, properties=payload)
-        return page_id
-
-    created = notion.pages.create(
-        parent={"database_id": dbid},
-        properties=payload,
-    )
-    return (created or {}).get("id", "")
+    created = notion.pages.create(parent={"database_id": OVERTIME_RULE_DB_ID}, properties=props)
+    return (created or {}).get("id") or ""
 
 def query_duty_month_to_horizontal_df(y: int, m: int, employees: list[str]):
     """
@@ -6591,6 +6558,7 @@ def create_announcement(publish_date: date, content: str, end_date: date | None,
 
 
 def create_lunch_order(employee_name: str, lunch_date: date, amount: float, actor: str = "") -> bool:
+    """新增午餐訂餐（依欄位名稱對位）。"""
     if not LUNCH_DB_ID:
         st.error("❌ 尚未設定 LUNCH_DB_ID（午餐訂餐表 Database ID）")
         return False
@@ -6600,40 +6568,40 @@ def create_lunch_order(employee_name: str, lunch_date: date, amount: float, acto
         st.error("❌ 員工姓名不可為空")
         return False
 
-    dbid = _normalize_notion_id(LUNCH_DB_ID) or LUNCH_DB_ID
-    props_meta = get_db_properties(dbid, force_refresh=True) or {}
-
-    title_key = resolve_title_prop_name(dbid) or _find_first_by_type(props_meta, "title")
-    if not title_key:
-        st.error("❌ 找不到午餐表的 Title 欄位（type=title）。請確認 Integration 已共享此資料庫。")
-        return False
-
-    amt_key = (
-        _find_prop_by_name_and_type(props_meta, ["訂餐金額", "金額", "餐費"], "number")
-        or _find_first_by_type(props_meta, "number")
-    )
-    date_key = (
-        _find_prop_by_name_and_type(props_meta, ["訂餐日期", "日期", "訂餐時間"], "date")
-        or _find_first_by_type(props_meta, "date")
-    )
-
-    props: dict = {title_key: {"title": [{"text": {"content": employee_name}}]}}
-    if amt_key:
-        props[amt_key] = {"number": float(amount or 0)}
-    if date_key:
-        props[date_key] = {"date": {"start": _safe_date_start(lunch_date)}}
-
     try:
-        notion.pages.create(parent={"database_id": dbid}, properties=props)
+        meta = get_db_properties(LUNCH_DB_ID, force_refresh=True) or {}
+
+        def has(name: str) -> bool:
+            return name in meta
+
+        props: dict = {}
+
+        # Title 欄位（你的表格叫「員工姓名」）
+        if has("員工姓名"):
+            props["員工姓名"] = {"title": [{"text": {"content": employee_name}}]}
+        else:
+            # 兼容：如果你改過欄位名
+            for cand in ["姓名", "Name", "Title", "內容"]:
+                if has(cand):
+                    props[cand] = {"title": [{"text": {"content": employee_name}}]}
+                    break
+
+        if has("訂餐金額"):
+            props["訂餐金額"] = {"number": float(amount or 0)}
+        elif has("金額"):
+            props["金額"] = {"number": float(amount or 0)}
+
+        if has("訂餐日期"):
+            props["訂餐日期"] = {"date": {"start": datetime.combine(lunch_date, datetime.min.time()).isoformat()}}
+        elif has("日期"):
+            props["日期"] = {"date": {"start": datetime.combine(lunch_date, datetime.min.time()).isoformat()}}
+
+        notion.pages.create(parent={"database_id": LUNCH_DB_ID}, properties=props)
         log_action(actor or employee_name, "午餐訂餐", f"{employee_name}｜{lunch_date.isoformat()}｜${float(amount or 0):.0f}", "成功")
         return True
+
     except Exception as e:
         st.error(f"寫入午餐訂餐失敗：{e}")
         log_action(actor or employee_name, "午餐訂餐", f"寫入失敗：{e}", "系統錯誤")
         return False
-
-
-# --- Compatibility aliases ---
-globals().setdefault("add_lunch_record", create_lunch_order)
-globals().setdefault("create_lunch_record", create_lunch_order)
 
