@@ -20,48 +20,21 @@ import re
 load_dotenv()
 
 def _get_cfg(key: str, default=None):
-    """優先讀取 Streamlit Cloud 的 st.secrets，其次讀取環境變數；都沒有則回傳 default。
-    ✅ 兼容：大小寫不同的 key（例如 secrets 用 notion_token / NOTION_TOKEN）
-    """
-    keys_to_try = [key, str(key).upper(), str(key).lower()]
-    # 1) Streamlit Secrets
+    """優先讀取 Streamlit Cloud 的 st.secrets，其次讀取環境變數；都沒有則回傳 default。"""
     try:
-        if hasattr(st, "secrets"):
-            for k in keys_to_try:
-                if k in st.secrets:
-                    return st.secrets[k]
-                # 有些人會放在 [general] 或其他 section 內（st.secrets 會是 dict-like）
-                try:
-                    v = st.secrets.get(k, None)  # type: ignore[attr-defined]
-                    if v is not None:
-                        return v
-                except Exception:
-                    pass
-            # 掃描一層巢狀（避免 secrets.toml 分段）
-            try:
-                for _, section in dict(st.secrets).items():
-                    if isinstance(section, dict):
-                        for k in keys_to_try:
-                            if k in section:
-                                return section[k]
-            except Exception:
-                pass
+        if hasattr(st, "secrets") and key in st.secrets:
+            return st.secrets[key]
     except Exception:
         pass
-
-    # 2) Environment Variables
-    for k in keys_to_try:
-        v = os.getenv(k)
-        if v is not None:
-            return v
-    return default
+    v = os.getenv(key)
+    return v if v is not None else default
 
 NOTION_TOKEN = _get_cfg("NOTION_TOKEN")
 ACCOUNT_DB_ID = _get_cfg("ACCOUNT_DB_ID")
 LEAVE_DB_ID = _get_cfg("LEAVE_DB_ID")
 VACATION_DB_ID = _get_cfg("VACATION_DB_ID")
 SALARY_DB_ID = _get_cfg("SALARY_DB_ID")  # ✅ 薪資計算表
-OPLOG_DB_ID = _get_cfg("OPLOG_DB_ID") or _get_cfg("OP_LOG_DB_ID") or _get_cfg("OPERATION_LOG_DB_ID")  # ✅ 操作記錄表
+OPLOG_DB_ID = _get_cfg("OPLOG_DB_ID")    # ✅ 操作記錄表
 CASHOUT_RULE_DB_ID = _get_cfg("CASHOUT_RULE_DB_ID")
 ANNOUNCE_DB_ID = _get_cfg("ANNOUNCE_DB_ID")  # ✅ 公告紀錄表
 PUNCH_DB_ID = _get_cfg("PUNCH_DB_ID")
@@ -95,187 +68,6 @@ if not SALARY_DB_ID:
     raise RuntimeError("❌ 請先在 .env 設定 SALARY_DB_ID（薪資計算表 Database ID）")
 
 notion = Client(auth=NOTION_TOKEN)
-
-
-# =========================
-# 🔧 Notion Database ID 正規化
-# - 支援：32 碼 hex（無連字號）、UUID（有連字號）、以及 notion.so/<id>?v=... 連結
-# - 避免部署端出現 404（其實是 ID 格式不被接受）導致抓不到 properties / query
-# =========================
-def _normalize_notion_db_id(raw: str) -> str:
-    if not raw:
-        return raw
-    s = str(raw).strip()
-
-    # 如果使用者不小心貼了整段 URL，就把 id 擷取出來
-    m = re.search(r"([0-9a-fA-F]{32})", s)
-    if m:
-        s = m.group(1)
-
-    # 32 碼轉成 UUID（8-4-4-4-12）
-    if re.fullmatch(r"[0-9a-fA-F]{32}", s):
-        s = f"{s[0:8]}-{s[8:12]}-{s[12:16]}-{s[16:20]}-{s[20:32]}"
-
-    return s
-
-
-# =========================
-# 🔧 Notion `databases.query` 相容修復
-# 有些部署環境會出現 `DatabasesEndpoint` 沒有 `query` 方法，導致「查無帳號」
-# 這裡提供 fallback：直接用 Notion REST API 呼叫 /databases/{db_id}/query
-# =========================
-
-def _notion_rest_db_query(database_id: str, payload: dict) -> dict:
-    import requests
-
-    token = NOTION_TOKEN
-    if not token:
-        raise RuntimeError("❌ NOTION_TOKEN 未設定，無法查詢 Notion Database")
-
-    notion_version = os.getenv("NOTION_VERSION", "2022-06-28")
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Notion-Version": notion_version,
-        "Content-Type": "application/json",
-    }
-    database_id = _normalize_notion_db_id(database_id)
-    url = f"https://api.notion.com/v1/databases/{database_id}/query"
-    resp = requests.post(url, headers=headers, json=payload, timeout=20)
-    resp.raise_for_status()
-    return resp.json()
-
-# 若 notion.databases.query 不存在，動態補上
-if not hasattr(notion.databases, "query"):
-    def _compat_databases_query(*, database_id: str, **kwargs):
-        payload = dict(kwargs) if kwargs else {}
-        return _notion_rest_db_query(_normalize_notion_db_id(database_id), payload)
-
-    try:
-        setattr(notion.databases, "query", _compat_databases_query)
-    except Exception:
-        # 若無法 setattr，就維持原狀；後續會在 debug 中顯示錯誤
-        pass
-
-
-# =========================
-# 🛠 部署端 Debug（可在「尚未登入」時使用）
-# 開啟方式：
-# 1) 網址加 ?debug=1
-# 2) Secrets / 環境變數：DEPLOY_DEBUG=1
-# 3) 登入頁面的「🛠 部署 Debug」展開後勾選
-# =========================
-def _get_query_param(name: str) -> str | None:
-    try:
-        # Streamlit >= 1.30
-        qp = getattr(st, "query_params", None)
-        if qp is not None:
-            v = qp.get(name)
-            if isinstance(v, list):
-                return v[0] if v else None
-            return v
-    except Exception:
-        pass
-    try:
-        qp = st.experimental_get_query_params()
-        v = qp.get(name)
-        if isinstance(v, list):
-            return v[0] if v else None
-        return v
-    except Exception:
-        return None
-
-def is_deploy_debug_enabled() -> bool:
-    # UI toggle（存在 session_state 就以它為主）
-    if "__deploy_debug" in st.session_state:
-        return bool(st.session_state.get("__deploy_debug"))
-    # URL
-    v = _get_query_param("debug")
-    if v is not None and str(v).strip() in ("1", "true", "True", "YES", "yes"):
-        return True
-    # Secrets / Env
-    v2 = _get_cfg("DEPLOY_DEBUG") or _get_cfg("DEBUG_NOTION") or os.getenv("DEPLOY_DEBUG") or os.getenv("DEBUG_NOTION")
-    if v2 is not None and str(v2).strip() in ("1", "true", "True", "YES", "yes"):
-        return True
-    return False
-
-
-def _dbg_safe_id(s: str, head: int = 6, tail: int = 4) -> str:
-    """Mask IDs/secrets for debug display."""
-    s = str(s or "")
-    if not s:
-        return ""
-    if len(s) <= head + tail:
-        return s
-    return f"{s[:head]}...{s[-tail:]}"
-
-
-def _debug_notion_account_probe(username: str) -> dict:
-    """Probe ACCOUNT_DB schema and the user's row (safe, masked) for deploy debugging."""
-    out: dict = {
-        "ACCOUNT_DB_ID": _dbg_safe_id(ACCOUNT_DB_ID),
-        "LOG_DB_ID": _dbg_safe_id(LOG_DB_ID) if 'LOG_DB_ID' in globals() else "",
-        "username": (username or "").strip(),
-    }
-    try:
-        out["bcrypt_version"] = getattr(bcrypt, "__version__", "unknown")
-    except Exception:
-        out["bcrypt_version"] = "unknown"
-
-    # DB title + prop types
-    try:
-        db = notion.databases.retrieve(database_id=_normalize_notion_db_id(ACCOUNT_DB_ID))
-        out["account_db_title"] = "".join([(x.get("plain_text") or "") for x in (db.get("title") or [])]).strip()
-        props = (db.get("properties", {}) or {}) if isinstance(db, dict) else {}
-        out["account_db_props"] = {k: (v.get("type") if isinstance(v, dict) else None) for k, v in props.items()}
-    except Exception as e:
-        out["account_db_retrieve_error"] = str(e)
-
-    uname = out["username"]
-    if uname:
-        tries = []
-        for ftype, flt in [
-            ("title.equals", {"property": "員工姓名", "title": {"equals": uname}}),
-            ("rich_text.equals", {"property": "員工姓名", "rich_text": {"equals": uname}}),
-        ]:
-            try:
-                res = notion.databases.query(database_id=_normalize_notion_db_id(ACCOUNT_DB_ID), filter=flt, page_size=5)
-                rows = res.get("results", []) if isinstance(res, dict) else []
-                item = {"filter": ftype, "count": len(rows), "page_id": _dbg_safe_id(rows[0].get("id")) if rows else ""}
-                if rows:
-                    p = (rows[0].get("properties", {}) or {})
-                    lh = _get_prop_plain_text(p.get("login_hash", {}))
-                    lp = _get_prop_plain_text(p.get("密碼", {}))
-                    item.update({
-                        "has_login_hash": bool(lh),
-                        "login_hash_len": len(lh) if lh else 0,
-                        "login_hash_prefix": (re.sub(r"\s+", "", lh)[:12] if lh else ""),
-                        "has_legacy_pwd": bool(lp),
-                        "legacy_pwd_len": len(lp) if lp else 0,
-                        "role": ((p.get("權限", {}) or {}).get("select") or {}).get("name"),
-                    })
-                tries.append(item)
-            except Exception as e:
-                tries.append({"filter": ftype, "error": str(e)})
-        out["account_query"] = tries
-
-    return out
-
-
-def _mask(s: str, head: int = 10, tail: int = 6) -> str:
-    s = s or ""
-    if len(s) <= head + tail:
-        return s
-    return f"{s[:head]}...{s[-tail:]}"
-
-def deploy_debug_note(msg: str):
-    # 同時印到 logs 與畫面（畫面只有在 debug 開啟時顯示）
-    try:
-        print(f"[DEPLOY_DEBUG] {msg}")
-    except Exception:
-        pass
-    if is_deploy_debug_enabled():
-        st.caption(f"🛠 {msg}")
-
 
 # =========================
 # ✅ 表格欄位清理（員工視角不顯示建立/更新時間）
@@ -330,13 +122,13 @@ def _get_prop_plain_text(prop: dict) -> str:
     """更通用的 Notion 文字讀取：支援 title / rich_text / select / multi_select / number / checkbox."""
     if not prop:
         return ""
-    # title / rich_text（可能會被切成多段，這裡要把所有段落串起來，否則像 bcrypt hash 會被截斷）
+    # title / rich_text
     if "title" in prop:
         arr = prop.get("title") or []
-        return "".join([(x.get("plain_text") or "") for x in arr]).strip() if arr else ""
+        return (arr[0].get("plain_text") or "").strip() if arr else ""
     if "rich_text" in prop:
         arr = prop.get("rich_text") or []
-        return "".join([(x.get("plain_text") or "") for x in arr]).strip() if arr else ""
+        return (arr[0].get("plain_text") or "").strip() if arr else ""
     # select / multi_select
     if "select" in prop and prop.get("select"):
         return (prop["select"].get("name") or "").strip()
@@ -348,8 +140,7 @@ def _get_prop_plain_text(prop: dict) -> str:
         return str(prop.get("number"))
     if "checkbox" in prop and prop.get("checkbox") is not None:
         return "True" if prop.get("checkbox") else "False"
-    return 
-
+    return ""
 
 def _build_notion_prop_value(db_id: str, props_meta: dict, prop_name: str, value):
     """依據資料庫欄位型態，自動組出 Notion API properties payload；不匹配就回傳 None（略過該欄位）。"""
@@ -423,57 +214,82 @@ def verify_password_bcrypt(plain: str, hashed: str) -> bool:
     if not plain or not hashed:
         return False
     try:
-        # ✅ Notion 的 rich_text / title 有時會把長字串切段或夾雜換行、空白
-        #    雲端部署時最常見的就是 login_hash 讀出來含有 \n / 空白，導致 bcrypt 驗證永遠失敗
-        cleaned = re.sub(r"\s+", "", str(hashed))
-        return bcrypt.checkpw(plain.encode("utf-8"), cleaned.encode("utf-8"))
+        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
     except Exception:
         return False
 
 
 def get_account_page_by_username(username: str) -> dict | None:
-    """用員工姓名找帳號管理表那一筆 page（不依賴 schema；依序嘗試 title / rich_text）"""
+    """用員工姓名找帳號管理表那一筆 page（自動適配 title / rich_text）"""
     username = (username or "").strip()
     if not username:
         return None
 
-    # ✅ 雲端偶爾會因為 schema 讀取失敗而導致查不到帳號（進而「帳號或密碼錯誤」）
-    #   這裡改成「不依賴 notion.databases.retrieve」，直接嘗試兩種常見型態的 filter。
     try:
-        res = notion.databases.query(
-            database_id=ACCOUNT_DB_ID,
-            filter={"property": "員工姓名", "title": {"equals": username}},
-            page_size=1,
-        )
-        results = res.get("results", [])
-        if results:
-            return results[0]
-    except Exception:
-        pass
+        props = get_db_properties(ACCOUNT_DB_ID) or {}
+        p = props.get("員工姓名", {}) or {}
+        ptype = p.get("type")
 
-    try:
+        if ptype == "title":
+            flt = {"property": "員工姓名", "title": {"equals": username}}
+        elif ptype == "rich_text":
+            flt = {"property": "員工姓名", "rich_text": {"equals": username}}
+        else:
+            # 找不到欄位或型態不是文字 → 直接查不到
+            return None
+
         res = notion.databases.query(
             database_id=ACCOUNT_DB_ID,
-            filter={"property": "員工姓名", "rich_text": {"equals": username}},
+            filter=flt,
             page_size=1,
         )
         results = res.get("results", [])
         return results[0] if results else None
+
     except Exception:
         return None
 
-@st.cache_data(ttl=60)
-def get_db_properties(database_id: str) -> dict:
-    try:
-        db = notion.databases.retrieve(database_id=_normalize_notion_db_id(database_id))
-        return db.get("properties", {}) or {}
-    except Exception as e:
-        # ✅ 佈署到 Streamlit Cloud 時，如果 secrets/token/權限或 DB_ID 有問題，這裡會失敗
-        #    開啟 DEBUG_NOTION=1 才顯示錯誤，避免一般使用者看到內部訊息
-        if os.getenv("DEBUG_NOTION", "").strip() == "1":
-            st.error(f"❌ Notion 讀取資料庫欄位失敗（{database_id}）：{e}")
-        return {}
 
+@st.cache_data(ttl=60)
+def _normalize_notion_id(raw: str | None) -> str:
+    """Extract a 32-hex Notion ID from raw (may be a URL / contains ?v=...)."""
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    # pull the first 32-hex chunk (database_id/page_id)
+    m = re.search(r"([0-9a-fA-F]{32})", s)
+    if m:
+        return m.group(1).lower()
+    # accept dashed uuid
+    m = re.search(r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})", s)
+    if m:
+        return m.group(1).replace("-", "").lower()
+    return s
+
+
+def get_db_properties(database_id: str, *, force_refresh: bool = False) -> dict:
+    """Return Notion database properties mapping.
+
+    Note: If this DB was previously not shared to the integration, Notion will return 404.
+    In deploy, we may have cached/kept an empty dict. Setting force_refresh=True ensures
+    we re-fetch and do not silently keep empty data.
+    """
+    dbid = _normalize_notion_id(database_id)
+    if not dbid:
+        return {}
+    try:
+        # We don't rely on Streamlit caching here for critical schema reads.
+        db = notion.databases.retrieve(database_id=dbid)
+        props = (db or {}).get("properties", {}) or {}
+        return props
+    except Exception as e:
+        # do NOT raise here (many screens probe schemas); caller can decide.
+        # keep the error string for debug if enabled.
+        if st.session_state.get("__deploy_debug_on") or (str(st.query_params.get("debug", "")) == "1"):
+            st.session_state.setdefault("__deploy_debug_errors", []).append(
+                {"kind": "db_properties", "dbid": dbid, "error": repr(e)}
+            )
+        return {}
 
 
 @st.cache_data(ttl=60)
@@ -1425,7 +1241,7 @@ def render_duty_schedule_page():
                 mm = st.number_input("月份", min_value=1, max_value=12, value=int(st.session_state.get("duty_m", datetime.now().month)), step=1, key="ot_rule_m")
 
                 st.caption("名稱會自動產生（YYYY-MM）")
-                st.text_input("紀錄", value=f"{int(yy)}-{int(mm):02d}", disabled=True, key="ot_rule_name")
+                st.text_input("名稱", value=f"{int(yy)}-{int(mm):02d}", disabled=True, key="ot_rule_name")
 
                 c1, c2 = st.columns(2)
                 with c1:
@@ -1445,17 +1261,6 @@ def render_duty_schedule_page():
                                 float(hourly_rate),
                                 note or "",
                             )
-                            # ✅ 操作記錄：加班設定寫入
-                            try:
-                                who = (st.session_state.get("employee_name") or st.session_state.get("user") or "系統")
-                                log_action(
-                                    who,
-                                    "加班設定",
-                                    f"{int(yy)}-{int(mm):02d} | 1次={float(shift_hours)}h | 時薪={float(hourly_rate)}" + (f" | {note.strip()}" if (note or "").strip() else ""),
-                                    "成功",
-                                )
-                            except Exception:
-                                pass
                             st.success(f"✅ 已寫入 Notion（page_id: {page_id[:8]}...）")
                             st.session_state["open_overtime_rule_dialog"] = False
                             st.rerun()
@@ -1714,7 +1519,7 @@ def get_overtime_count_hours(employee: str, y: int, m: int) -> float:
                 {"property": k_emp, "title": {"equals": employee}},
             ]
         }
-        res = notion.databases.query(database_id=_normalize_notion_db_id(OVERTIME_COUNT_DB_ID), page_size=5, filter=flt)
+        res = notion.databases.query(database_id=OVERTIME_COUNT_DB_ID, page_size=5, filter=flt)
         results = (res or {}).get("results", []) or []
         if not results:
             return 0.0
@@ -1749,7 +1554,7 @@ def upsert_overtime_count_to_notion(employee: str, y: int, m: int, hours: float,
                 {"property": k_emp, "title": {"equals": employee}},
             ]
         }
-        res = notion.databases.query(database_id=_normalize_notion_db_id(OVERTIME_COUNT_DB_ID), page_size=5, filter=flt)
+        res = notion.databases.query(database_id=OVERTIME_COUNT_DB_ID, page_size=5, filter=flt)
         results = (res or {}).get("results", []) or []
         page_id = results[0]["id"] if results else None
 
@@ -2032,120 +1837,98 @@ def _get_default_shift_options() -> list[str]:
     return ["收費員(中)", "收費員(晚)", "檢驗線(中)", "檢驗線(晚)"]
 
 
-def upsert_overtime_rule_to_notion(y: int, m: int, shift_hours: float, hourly_rate: float, note: str) -> str:
-    """同年同月：有就更新，沒有就新增。回傳 page_id。
-
-    ⚠️ DB 欄位名稱可能被改過（例如多了括號/空白），因此這裡用「自動對應」欄位，避免 payload 被過濾到空字典，導致 Notion 只建立時間卻沒有任何欄位值。
-    """
-
+def upsert_overtime_rule_to_notion(
+    y: int,
+    m: int,
+    shift_hours: float,
+    hourly_rate: float,
+    note: str = "",
+) -> str:
+    """同年同月：有就更新，沒有就新增（加班設定表）。回傳 page_id。"""
     if not OVERTIME_RULE_DB_ID:
-        raise RuntimeError("❌ 尚未設定 OVERTIME_RULE_DB_ID（加班設定表 Database ID）")
+        raise RuntimeError("尚未設定 OVERTIME_RULE_DB_ID（加班設定表 DB ID）")
 
-    props_meta = get_db_properties(OVERTIME_RULE_DB_ID) or {}
+    # 讀 DB schema（避免欄位型別不一致）
+    db = notion.databases.retrieve(database_id=OVERTIME_RULE_DB_ID)
+    props = (db or {}).get("properties", {}) or {}
 
-    def _norm(s: str) -> str:
-        return str(s or "").replace(" ", "").replace("　", "").strip().lower()
+    def _ptype(name: str) -> str | None:
+        return (props.get(name) or {}).get("type")
 
-    def _find_prop_by_type(p_type: str) -> str | None:
-        for k, v in props_meta.items():
-            if (v or {}).get("type") == p_type:
-                return k
-        return None
+    def _rt(val: str):
+        return {"rich_text": [{"text": {"content": str(val)}}]}
 
-    def _resolve(candidates: list[str], fallback_type: str | None = None) -> str | None:
-        keys = list(props_meta.keys())
-        cset = [_norm(c) for c in candidates if c]
-        # exact
-        for k in keys:
-            if _norm(k) in cset:
-                return k
-        # contains
-        for k in keys:
-            nk = _norm(k)
-            for c in cset:
-                if c and c in nk:
-                    return k
-        # type fallback
-        if fallback_type:
-            return _find_prop_by_type(fallback_type)
-        return None
+    def _title(val: str):
+        return {"title": [{"text": {"content": str(val)}}]}
 
-    k_title = _find_prop_by_type("title")
-
-    # 有些情況會另外存在一個叫「名稱」的文字欄位（rich_text），而 Title 欄位本身可能被改名成別的。
-    # 這裡會：Title 一定寫入到 type=title 的欄位；若同時存在 rich_text 的「名稱」，也一併寫入，避免畫面看起來像沒填。
-    k_name_text: str | None = None
-    for _k, _v in (props_meta or {}).items():
+    def _num(val):
         try:
-            if _norm(_k) == _norm("名稱") and (_v or {}).get("type") == "rich_text":
-                k_name_text = _k
-                break
+            return {"number": float(val)}
         except Exception:
-            pass
+            return {"number": None}
 
-    k_year  = _resolve(["年份", "年度", "year"], fallback_type="number")
-    k_month = _resolve(["月份", "月", "month"], fallback_type="number")
-    k_shift = _resolve(["班次換算時數", "換算時數", "班次時數", "shift", "hours"], fallback_type="number")
-    k_rate  = _resolve(["加班時薪", "時薪", "hourly", "rate"], fallback_type="number")
-    k_note  = _resolve(["備註", "note", "備註說明"], fallback_type="rich_text")
+    def _ms(vals: list[str]):
+        return {"multi_select": [{"name": str(v)} for v in vals if str(v).strip()]}
 
-    if not k_title:
-        raise RuntimeError(f"❌ 找不到加班設定表的 Title 欄位（type=title）。請確認資料庫存在可用的 Title 欄位。欄位清單：{list((props_meta or {}).keys())}")
+    def _sel(val: str):
+        return {"select": {"name": str(val)}} if str(val).strip() else {"select": None}
 
-    payload: dict = {
-        k_title: {"title": [{"text": {"content": f"{int(y)}-{int(m):02d}"}}]}
+    def _set(name: str, value):
+        t = _ptype(name)
+        if t == "title":
+            return _title(value)
+        if t == "number":
+            return _num(value)
+        if t == "rich_text":
+            return _rt(value)
+        if t == "select":
+            return _sel(value)
+        if t == "multi_select":
+            # value 可能是 list[str] 或字串
+            if isinstance(value, (list, tuple)):
+                return _ms(list(value))
+            return _ms([str(value)])
+        # fallback：當作 rich_text
+        return _rt(value)
+
+    name = f"{int(y)}-{int(m):02d}"
+
+    payload = {
+        "名稱": _set("名稱", name),
+        "年份": _set("年份", int(y)),
+        "月份": _set("月份", int(m)),
+        "班次換算時數": _set("班次換算時數", shift_hours),
+        "加班時薪": _set("加班時薪", hourly_rate),
+        "備註": _set("備註", note or ""),
     }
-    if k_name_text:
-        payload[k_name_text] = {"rich_text": [{"text": {"content": f"{int(y)}-{int(m):02d}"}}]}
 
-    def _num(v):
-        try:
-            return float(v)
-        except Exception:
-            return None
+    # 只送 DB 真的存在的欄位（避免 Notion 噴錯）
+    payload = {k: v for k, v in payload.items() if k in props}
 
-    if k_year and props_meta.get(k_year, {}).get("type") == "number":
-        payload[k_year] = {"number": int(y)}
-    if k_month and props_meta.get(k_month, {}).get("type") == "number":
-        payload[k_month] = {"number": int(m)}
-    if k_shift and props_meta.get(k_shift, {}).get("type") == "number":
-        vv = _num(shift_hours)
-        if vv is not None:
-            payload[k_shift] = {"number": vv}
-    if k_rate and props_meta.get(k_rate, {}).get("type") == "number":
-        vv = _num(hourly_rate)
-        if vv is not None:
-            payload[k_rate] = {"number": vv}
+    # 查同年同月是否已存在
+    res = notion.databases.query(
+        database_id=OVERTIME_RULE_DB_ID,
+        page_size=5,
+        filter={
+            "and": [
+                {"property": "年份", "number": {"equals": int(y)}},
+                {"property": "月份", "number": {"equals": int(m)}},
+            ]
+        },
+    )
+    results = (res or {}).get("results", []) or []
+    if results:
+        page_id = results[0]["id"]
+        notion.pages.update(page_id=page_id, properties=payload)
+        return page_id
 
-    if k_note:
-        t = str(note or "").strip()
-        if (props_meta.get(k_note, {}) or {}).get("type") == "rich_text":
-            payload[k_note] = {"rich_text": [{"text": {"content": t}}]} if t else {"rich_text": []}
+    created = notion.pages.create(
+        parent={"database_id": OVERTIME_RULE_DB_ID},
+        properties=payload,
+    )
+    return (created or {}).get("id", "")
 
-    existing_id = None
-    if k_year and k_month and (k_year in props_meta) and (k_month in props_meta):
-        try:
-            res = notion.databases.query(
-                database_id=OVERTIME_RULE_DB_ID,
-                page_size=10,
-                filter={
-                    "and": [
-                        {"property": k_year, "number": {"equals": int(y)}},
-                        {"property": k_month, "number": {"equals": int(m)}},
-                    ]
-                },
-            )
-            if res.get("results"):
-                existing_id = res["results"][0]["id"]
-        except Exception:
-            existing_id = None
 
-    if existing_id:
-        notion.pages.update(page_id=existing_id, properties=payload)
-        return existing_id
-
-    created = notion.pages.create(parent={"database_id": OVERTIME_RULE_DB_ID}, properties=payload)
-    return created["id"]
 def query_duty_month_to_horizontal_df(y: int, m: int, employees: list[str]):
     """
     ✅ 依你目前 Notion【值班排班表】的欄位結構查詢（一天一筆）：
@@ -2274,71 +2057,44 @@ def resolve_salary_food_prop_name() -> str | None:
 # ✅ 操作記錄表：寫入 / 讀取
 # =========================
 def log_action(employee_name: str, action_type: str, action_content: str, result: str):
-    """寫入「操作記錄表」(Operation Log)
-
-    你的「操作時間」是 Notion 的「建立時間(created_time)」欄位，所以它會自動出現；
-    目前只寫入了「員工姓名(title)」，原因通常是「抓不到 DB schema → props_meta 為空」導致只走最安全的 title 寫入。
-
-    這裡改成：先用 title 建立一筆(必成功)，再用 pages.update 逐欄位補寫
-    （逐欄位寫，避免某一欄型態不吻合導致整次 update 失敗）。
+    """寫入「操作記錄表」：不強制欄位型態，盡力填入可用欄位。
+    ✅ 重點：
+    - 永遠會寫入「title 欄位」（不管它叫什麼），避免雲端只出現空白列
+    - 其他欄位（員工姓名/操作類型/操作內容/操作結果/操作時間）依資料庫實際型態自動適配
     """
     if not OPLOG_DB_ID:
         return
 
-    emp = (employee_name or "").strip() or "—"
-    act = (action_type or "").strip() or "—"
-    content = (action_content or "").strip() or "—"
-    res_txt = (result or "").strip() or "—"
-
-    def _debug_enabled() -> bool:
-        return str(os.getenv("DEPLOY_DEBUG", "")).strip() == "1" or str(os.getenv("DEBUG_NOTION", "")).strip() == "1"
-
-    def _safe_update(page_id: str, props: dict):
-        try:
-            notion.pages.update(page_id=page_id, properties=props)
-            return True, None
-        except Exception as e:
-            return False, e
+    employee_name = (employee_name or "").strip()
+    action_type = (action_type or "").strip()
+    action_content = (action_content or "").strip()
+    result = (result or "").strip()
 
     try:
-        # 1) 先建立最小可行列：只寫 title（Notion DB 一定有 title）
         props_meta = get_db_properties(OPLOG_DB_ID) or {}
-        title_prop = _first_title_prop_name(props_meta) or "員工姓名"
+        props: dict = {}
 
-        create_props = {
-            title_prop: {"title": [{"text": {"content": emp or "—"}}]}
-        }
+        # 1) 一定要填 title 欄位（Notion DB 必有）
+        title_prop = _first_title_prop_name(props_meta)
+        if title_prop:
+            # 優先用員工姓名，沒有就用操作類型/內容當 title
+            title_value = employee_name or action_type or action_content or "—"
+            props[title_prop] = {"title": [{"text": {"content": str(title_value)}}]}
 
-        created = notion.pages.create(parent={"database_id": OPLOG_DB_ID}, properties=create_props)
-        page_id = created.get("id")
+        # 2) 其他欄位：依實際型態盡力寫入（不存在就略過）
+        _best_set_text(props, props_meta, "員工姓名", employee_name or "—")
+        _best_set_text(props, props_meta, "操作類型", action_type)
+        _best_set_text(props, props_meta, "操作內容", action_content)
+        _best_set_select(props, props_meta, OPLOG_DB_ID, "操作結果", result)
 
-        if not page_id:
-            # 理論上不會發生，但保底
-            if _debug_enabled():
-                st.error("❌ 操作記錄建立成功但拿不到 page_id（無法補寫欄位）")
-            return
+        # 3) 操作時間：如果你的欄位是 date，才手動寫入；若是 created_time 則 Notion 會自動填
+        if "操作時間" in props_meta:
+            p_type = (props_meta.get("操作時間", {}) or {}).get("type")
+            if p_type == "date":
+                props["操作時間"] = {"date": {"start": datetime.now().isoformat()}}
 
-        # 2) 逐欄位補寫（即使抓不到 schema 也照寫；寫失敗就略過）
-        # 2-1) 操作類型：先試 status，再試 select，再試 rich_text
-        ok, err = _safe_update(page_id, {"操作類型": {"status": {"name": act}}})
-        if not ok:
-            ok, err = _safe_update(page_id, {"操作類型": {"select": {"name": act}}})
-        if not ok:
-            ok, err = _safe_update(page_id, {"操作類型": {"rich_text": [{"text": {"content": act}}]}})
-
-        # 2-2) 操作內容：rich_text
-        _safe_update(page_id, {"操作內容": {"rich_text": [{"text": {"content": content}}]}})
-
-        # 2-3) 操作結果：先試 status，再試 select，再試 rich_text
-        ok, err = _safe_update(page_id, {"操作結果": {"status": {"name": res_txt}}})
-        if not ok:
-            ok, err = _safe_update(page_id, {"操作結果": {"select": {"name": res_txt}}})
-        if not ok:
-            _safe_update(page_id, {"操作結果": {"rich_text": [{"text": {"content": res_txt}}]}})
-
-    except Exception as e:
-        if str(os.getenv("DEBUG_NOTION", "")).strip() == "1":
-            st.error(f"❌ 寫入操作記錄失敗：{e}")
+        notion.pages.create(parent={"database_id": OPLOG_DB_ID}, properties=props)
+    except Exception:
         return
 
 
@@ -2518,21 +2274,13 @@ def login(username: str, password: str):
     username = (username or "").strip()
     password = (password or "").strip()
 
-    # Debug：每次嘗試登入先清空上一次資訊
-    if is_deploy_debug_enabled():
-        st.session_state["__debug_login"] = {}
-
     if not username or not password:
-        if is_deploy_debug_enabled():
-            st.session_state["__debug_login"].update({"stage": "empty_credentials", "probe": _debug_notion_account_probe(username)})
         log_action(username or "—", "登入", "帳號或密碼為空", "失敗")
         return False, False, False
 
     try:
         page = get_account_page_by_username(username)
         if not page:
-            if is_deploy_debug_enabled():
-                st.session_state["__debug_login"].update({"stage": "account_not_found", "probe": _debug_notion_account_probe(username)})
             log_action(username, "登入", "找不到帳號", "失敗")
             return False, False, False
 
@@ -2543,27 +2291,9 @@ def login(username: str, password: str):
         role = sel.get("name") if sel else None
         is_admin = (role == "管理員")
 
-        if is_deploy_debug_enabled():
-            st.session_state["__debug_login"].update({
-                "username": username,
-                "found_page": True,
-                "role": role,
-                "is_admin": is_admin,
-            })
-
         login_hash = _get_prop_plain_text(props.get("login_hash", {}))
         legacy_pwd = _get_prop_plain_text(props.get("密碼", {}))
         must_change_flag = bool((props.get("must_change_password", {}) or {}).get("checkbox") or False)
-
-        if is_deploy_debug_enabled():
-            st.session_state["__debug_login"].update({
-                "has_login_hash": bool(login_hash),
-                "login_hash_len": len(login_hash) if login_hash else 0,
-                "login_hash_mask": _mask(login_hash, 12, 8) if login_hash else "",
-                "has_legacy_pwd": bool(legacy_pwd),
-                "legacy_pwd_len": len(legacy_pwd) if legacy_pwd else 0,
-                "must_change_flag": must_change_flag,
-            })
 
         used_legacy = False
 
@@ -2573,16 +2303,7 @@ def login(username: str, password: str):
             ok = (password == legacy_pwd)
             used_legacy = bool(ok)
 
-        if is_deploy_debug_enabled():
-            st.session_state["__debug_login"].update({
-                "used_legacy": used_legacy,
-                "bcrypt_ok": bool(ok) if login_hash else None,
-                "legacy_ok": bool(ok) if (not login_hash) else None,
-            })
-
         if not ok:
-            if is_deploy_debug_enabled():
-                st.session_state["__debug_login"].update({"stage": "verify_failed", "probe": _debug_notion_account_probe(username)})
             log_action(username, "登入", "帳號或密碼錯誤", "失敗")
             return False, False, False
 
@@ -2960,7 +2681,7 @@ def calc_used_vacation_hours(employee_name: str, year: int) -> float:
 # =========================
 def list_employee_names(limit: int = 200):
     try:
-        res = notion.databases.query(database_id=_normalize_notion_db_id(ACCOUNT_DB_ID), page_size=min(limit, 100))
+        res = notion.databases.query(database_id=ACCOUNT_DB_ID, page_size=min(limit, 100))
         names = []
         for page in res.get("results", []):
             props = page["properties"]
@@ -3822,49 +3543,32 @@ def upsert_attendance_record(employee_name: str, attend_date: date, status: str,
         return False
 
     try:
-        # 驗證狀態選項（若取不到 options，仍允許寫入；讓 Notion 端決定是否擋下）
-        options = get_select_options(ATTEND_DB_ID, "出勤狀態") or [
-            ATTEND_PRESENT_STATUS, ATTEND_LEAVE_STATUS, ATTEND_LATE_STATUS
-        ]
-        if options and (status not in options):
+        props_meta = get_db_properties(ATTEND_DB_ID)
+
+        def has_prop(n: str) -> bool:
+            return n in (props_meta or {})
+
+        # 驗證狀態選項
+        options = get_select_options(ATTEND_DB_ID, "出勤狀態") or [ATTEND_PRESENT_STATUS, ATTEND_LEAVE_STATUS, ATTEND_LATE_STATUS]
+        if status not in options:
             st.error(f"❌ 出勤狀態 Notion 選項不存在：{status}（請先在 Notion 建立選項）")
             return False
 
         page_id = find_attendance_page(employee_name, attend_date)
 
-        attend_iso = datetime.combine(attend_date, datetime.min.time()).isoformat()
-
-        # 不依賴 database properties schema（部署端曾出現 retrieve 失敗導致 props_meta={}，進而寫出空白列）
-        # 直接用既定欄位名嘗試寫入，若 Notion 回報型別不符，再用 fallback 型別重試。
-        base_props = {
-            "員工姓名": {"title": [{"text": {"content": employee_name}}]},
-            "出勤日期": {"date": {"start": attend_iso}},
-            "出勤狀態": {"select": {"name": status}},
-        }
-
-        def _try_write(props: dict) -> None:
-            if page_id:
-                notion.pages.update(page_id=page_id, properties=props)
-            else:
-                notion.pages.create(parent={"database_id": ATTEND_DB_ID}, properties=props)
-
-        try:
-            _try_write(base_props)
-        except Exception as e1:
-            # 1) 員工姓名：若不是 title（例如 rich_text），改用 rich_text
-            props2 = dict(base_props)
-            props2["員工姓名"] = {"rich_text": [{"text": {"content": employee_name}}]}
-            try:
-                _try_write(props2)
-            except Exception as e2:
-                # 2) 出勤狀態：可能是 status 類型（Notion 新屬性），改用 status
-                props3 = dict(props2)
-                props3["出勤狀態"] = {"status": {"name": status}}
-                _try_write(props3)
+        props = {}
+        if has_prop("員工姓名") and (not page_id):
+            props["員工姓名"] = {"title": [{"text": {"content": employee_name}}]}
+        if has_prop("出勤日期"):
+            props["出勤日期"] = {"date": {"start": datetime.combine(attend_date, datetime.min.time()).isoformat()}}
+        if has_prop("出勤狀態"):
+            props["出勤狀態"] = {"select": {"name": status}}
 
         if page_id:
+            notion.pages.update(page_id=page_id, properties=props)
             log_action(actor or "—", "出勤更新", f"{employee_name}｜{attend_date.isoformat()}｜{status}", "成功")
         else:
+            notion.pages.create(parent={"database_id": ATTEND_DB_ID}, properties=props)
             log_action(actor or "—", "出勤新增", f"{employee_name}｜{attend_date.isoformat()}｜{status}", "成功")
 
         return True
@@ -4167,26 +3871,18 @@ def create_lunch_record(employee_name: str, lunch_date: date, amount: float, act
         return False
 
     try:
-        props_meta = get_db_properties(LUNCH_DB_ID) or {}
+        props_meta = get_db_properties(LUNCH_DB_ID)
 
-        # 兼容：若先前曾快取到空的 properties（例如當時 DB ID/權限有誤），這裡再強制重抓一次
-        if not props_meta:
-            try:
-                _db = notion.databases.retrieve(database_id=_normalize_notion_db_id(LUNCH_DB_ID))
-                props_meta = _db.get("properties", {}) or {}
-            except Exception:
-                pass
+        def has_prop(n: str) -> bool:
+            return n in (props_meta or {})
 
-        # 依資料庫實際欄位名稱做容錯（有些 Notion 欄位可能被改名）
-        k_emp = resolve_prop_key(props_meta, "員工姓名") or "員工姓名"
-        k_amount = resolve_prop_key(props_meta, "訂餐金額") or "訂餐金額"
-        k_date = resolve_prop_key(props_meta, "訂餐日期") or "訂餐日期"
-
-        props = {
-            k_emp: {"title": [{"text": {"content": employee_name}}]},
-            k_amount: {"number": float(amount or 0)},
-            k_date: {"date": {"start": datetime.combine(lunch_date, datetime.min.time()).isoformat()}},
-        }
+        props = {}
+        if has_prop("員工姓名"):
+            props["員工姓名"] = {"title": [{"text": {"content": employee_name}}]}
+        if has_prop("訂餐金額"):
+            props["訂餐金額"] = {"number": float(amount or 0)}
+        if has_prop("訂餐日期"):
+            props["訂餐日期"] = {"date": {"start": datetime.combine(lunch_date, datetime.min.time()).isoformat()}}
 
         notion.pages.create(parent={"database_id": LUNCH_DB_ID}, properties=props)
         log_action(actor or employee_name, "午餐訂餐", f"{employee_name}｜{lunch_date.isoformat()}｜${float(amount or 0):.0f}", "成功")
@@ -4615,29 +4311,29 @@ if not st.session_state["logged_in"]:
             font-size: 26px;
             font-weight: 800;
             margin: 6px 0 18px 0;
-                    color: rgba(55, 62, 120, 0.92);  #文字顏色
-                    letter-spacing: 0.3px;
-                }
-        
-                /* inputs */
-                div[data-testid="stForm"] label {
-                    font-weight: 700 !important;
-                    color: rgba(20, 35, 55, 0.86) !important;
-                }
-                div[data-testid="stForm"] .stTextInput > div > div > input {
-                    height: 48px !important;
-                    border-radius: 12px !important;
-                    background: rgba(235, 246, 255, 0.55) !important;
-                    border: 1px solid rgba(0, 90, 150, 0.18) !important;
-                    box-shadow: inset 0 1px 0 rgba(255,255,255,0.55);
-                }
-                div[data-testid="stForm"] .stTextInput > div > div > input:focus {
-                    border-color: rgba(0, 90, 150, 0.48) !important;
-                    box-shadow: 0 0 0 4px rgba(0, 90, 150, 0.16) !important;
-                }
-        
-                /* submit button */
-                div[data-testid="stForm"] .stButton > button,
+            color: rgba(55, 62, 120, 0.92);  #文字顏色
+            letter-spacing: 0.3px;
+        }
+
+        /* inputs */
+        div[data-testid="stForm"] label {
+            font-weight: 700 !important;
+            color: rgba(20, 35, 55, 0.86) !important;
+        }
+        div[data-testid="stForm"] .stTextInput > div > div > input {
+            height: 48px !important;
+            border-radius: 12px !important;
+            background: rgba(235, 246, 255, 0.55) !important;
+            border: 1px solid rgba(0, 90, 150, 0.18) !important;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.55);
+        }
+        div[data-testid="stForm"] .stTextInput > div > div > input:focus {
+            border-color: rgba(0, 90, 150, 0.48) !important;
+            box-shadow: 0 0 0 4px rgba(0, 90, 150, 0.16) !important;
+        }
+
+        /* submit button */
+        div[data-testid="stForm"] .stButton > button,
         div[data-testid="stForm"] .stFormSubmitButton > button {
             width: 100% !important;
             height: 54px !important;
@@ -4664,15 +4360,6 @@ if not st.session_state["logged_in"]:
     # ✅ 版面置中（不影響其他頁）
     pad1, center, pad2 = st.columns([1, 1.2, 1])
     with center:
-        # 🛠 部署 Debug：尚未登入也能開啟
-        with st.expander("🛠 部署 Debug（尚未登入也可用）", expanded=is_deploy_debug_enabled()):
-            _ui_default = is_deploy_debug_enabled()
-            st.session_state["__deploy_debug"] = st.checkbox("開啟 Debug", value=_ui_default, key="__deploy_debug_cb")
-            if st.session_state.get("__debug_login"):
-                st.write("🔎 Debug / login()")
-                st.json(st.session_state.get("__debug_login"))
-            st.caption("開啟方式：?debug=1 或 Secrets/Env：DEPLOY_DEBUG=1")
-
         # ✅ 把登入區改成 st.form：外框就是表單容器，所以「一定會被包在卡片裡」
         with st.form("login_form", clear_on_submit=False):
             st.markdown('<div class="login-icon"><span>🔐</span></div>', unsafe_allow_html=True)
