@@ -1010,7 +1010,7 @@ def _make_announce_title(content: str, pub_date: date) -> str:
 
 def create_announcement(publish_date: date, content: str, end_date: date | None, actor: str = "") -> bool:
     if not ANNOUNCE_DB_ID:
-        st.error("❌ 尚未設定 ANNOUNCE_DB_ID（公告紀錄表 Database ID）")
+        st.error("❌ 尚未設定 ANNOUNCE_DB_ID")
         return False
 
     content = (content or "").strip()
@@ -1018,78 +1018,60 @@ def create_announcement(publish_date: date, content: str, end_date: date | None,
         st.error("❌ 公告內容不可為空")
         return False
 
+    # 1. 嘗試抓 Schema
+    props_meta = get_db_properties(ANNOUNCE_DB_ID, force_refresh=True) or {}
+
+    # 2. 設定預設欄位名稱 (暴力預設)
+    # 通常 Notion 預設 Title 叫 "Name" 或 "標題"，但你的截圖沒顯示欄位名
+    # 我們先假設 Title 欄位叫 "標題" 或 "公告標題"
+    # ⚠️ 請去 Notion 確認公告表的第一個欄位叫什麼名字，填在下面
+    target_title_col = "標題"  # <--- 請確認這個
+    target_content_col = "公告內容"
+    target_pub_col = "發布日期"
+    target_end_col = "結束時間"
+    target_done_col = "完成情況"
+
+    # 3. 如果抓得到 Schema，自動校正
+    if props_meta:
+        for name, meta in props_meta.items():
+            t = meta.get("type")
+            if t == "title":
+                target_title_col = name
+            elif t == "rich_text" and ("內容" in name):
+                target_content_col = name
+            elif t == "date" and ("發布" in name or "發佈" in name):
+                target_pub_col = name
+            elif t == "date" and ("結束" in name):
+                target_end_col = name
+            elif t == "checkbox":
+                target_done_col = name
+
+    # 4. 組裝
+    props = {}
+    
+    # Title (必填) - 用內容前3個字當標題
+    title_text = content[:3]
+    props[target_title_col] = {"title": [{"text": {"content": title_text}}]}
+
+    # 內容 (Rich Text)
+    props[target_content_col] = {"rich_text": [{"text": {"content": content}}]}
+
+    # 發布日期
+    props[target_pub_col] = {"date": {"start": datetime.combine(publish_date, datetime.min.time()).isoformat()}}
+
+    # 結束日期
+    if end_date:
+        props[target_end_col] = {"date": {"start": datetime.combine(end_date, datetime.min.time()).isoformat()}}
+        
+    # 完成情況
+    props[target_done_col] = {"checkbox": False}
+
     try:
-        props_meta = get_db_properties(ANNOUNCE_DB_ID, force_refresh=True) or {}
-        title_prop = resolve_title_prop_name(ANNOUNCE_DB_ID)  # 自動找 type=title 的欄位
-
-        # 容錯：欄位名可能有全形括號/全形空白/多空白
-        def _norm(s: str) -> str:
-            if s is None:
-                return ""
-            s = str(s)
-            trans = str.maketrans({"（": "(", "）": ")", "　": " ", "\u00A0": " "})
-            s = s.translate(trans)
-            s = s.replace(" ", "")
-            return s.strip().lower()
-
-        def _find_prop(want: str, want_type: str | None = None) -> str | None:
-            wn = _norm(want)
-            for k, meta in (props_meta or {}).items():
-                if _norm(k) == wn and (want_type is None or (meta or {}).get("type") == want_type):
-                    return k
-            return None
-
-        def _find_any(wants: list[str], want_type: str | None = None) -> str | None:
-            for w in wants:
-                hit = _find_prop(w, want_type)
-                if hit:
-                    return hit
-            return None
-
-        done_prop = _find_any(["完成情況", "完成狀態"], "checkbox")
-        pub_prop = _find_any(["發布日期", "發佈日期", "發布時間"], "date")
-        end_prop = _find_any(["結束時間", "結束日期"], "date")
-        # 公告內容欄位：優先找「公告內容」，其次找「內容」（如果你把 rich_text 欄位改名）
-        content_prop = _find_any(["公告內容", "內容"], None)
-
-        props = {}
-
-        # ✅ Title（Notion 必填）—你不想用標題欄，所以用「內容前 3 字」當 title
-        if title_prop is not None:
-            head = (content or "").strip().replace("\n", " ").replace("\r", " ")[:3].strip()
-            props[title_prop] = {"title": [{"text": {"content": head or "公告"}}]}
-
-        # ✅ 完成情況（預設 False）
-        if done_prop:
-            props[done_prop] = {"checkbox": False}
-
-        # ✅ 發布日期
-        if pub_prop:
-            props[pub_prop] = {"date": {"start": datetime.combine(publish_date, datetime.min.time()).isoformat()}}
-
-        # ✅ 公告內容（rich_text / title 皆可）
-        if content_prop:
-            ptype = (props_meta.get(content_prop) or {}).get("type")
-            if ptype == "rich_text":
-                props[content_prop] = {"rich_text": [{"text": {"content": content}}]}
-            elif ptype == "title":
-                # 如果你把「公告內容」做成 title，也能寫
-                props[content_prop] = {"title": [{"text": {"content": content}}]}
-            else:
-                # 其他型態不寫，避免 Notion 400
-                pass
-
-        # ✅ 結束時間（可空）
-        if end_date and end_prop:
-            props[end_prop] = {"date": {"start": datetime.combine(end_date, datetime.min.time()).isoformat()}}
-
         notion.pages.create(parent={"database_id": ANNOUNCE_DB_ID}, properties=props)
-        log_action(actor or "—", "公告管理", f"新增公告：{publish_date.isoformat()}｜{content[:30]}", "成功")
+        log_action(actor or "—", "公告管理", f"新增公告：{publish_date.isoformat()}", "成功")
         return True
-
     except Exception as e:
-        st.error(f"新增公告失敗：{e}")
-        log_action(actor or "—", "公告管理", f"新增公告失敗：{e}", "系統錯誤")
+        st.error(f"公告新增失敗 (請確認欄位 '{target_title_col}' 是否存在): {e}")
         return False
 
 
