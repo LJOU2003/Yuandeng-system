@@ -133,6 +133,71 @@ if not hasattr(notion.databases, "query"):
         pass
 
 
+
+# =========================
+# ✅ Notion Query-Logic 統一封裝（避免 SDK / 部署環境不穩、或快取到空 schema）
+# - 所有查詢一律走 databases.query（必要時 fallback REST）
+# - databases.retrieve 也提供 REST fallback，並且不會把「空 properties」寫進快取
+# =========================
+
+def _notion_rest_db_retrieve(database_id: str) -> dict:
+    import requests
+    token = NOTION_TOKEN
+    if not token:
+        raise RuntimeError("❌ NOTION_TOKEN 未設定，無法讀取 Notion Database")
+    notion_version = os.getenv("NOTION_VERSION", "2022-06-28")
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Notion-Version": notion_version,
+        "Content-Type": "application/json",
+    }
+    dbid = _normalize_notion_id(database_id) or database_id
+    url = f"https://api.notion.com/v1/databases/{dbid}"
+    resp = requests.get(url, headers=headers, timeout=20)
+    resp.raise_for_status()
+    return resp.json()
+
+def db_retrieve(database_id: str) -> dict:
+    """安全取得 DB schema（properties）。"""
+    dbid = _normalize_notion_id(database_id) or database_id
+    try:
+        return db_retrieve(database_id=dbid)
+    except Exception:
+        return _notion_rest_db_retrieve(dbid)
+
+def db_query(*, database_id: str, **kwargs) -> dict:
+    """安全 databases.query：永遠先正規化 DB ID，必要時 fallback REST。"""
+    dbid = _normalize_notion_id(database_id) or database_id
+    payload = dict(kwargs) if kwargs else {}
+    # notion_client 的 query 參數就是 payload，本質會被轉成 JSON body
+    try:
+        return db_query(database_id=dbid, **payload)
+    except Exception:
+        return _notion_rest_db_query(dbid, payload)
+
+def db_query_all(*, database_id: str, **kwargs) -> list:
+    """取得資料庫所有符合條件的 pages（自動翻頁）。"""
+    results = []
+    start_cursor = None
+    while True:
+        payload = dict(kwargs) if kwargs else {}
+        payload.setdefault("page_size", 100)
+        if start_cursor:
+            payload["start_cursor"] = start_cursor
+        res = db_query(database_id=database_id, **payload)
+        batch = res.get("results", []) or []
+        results.extend(batch)
+        if not res.get("has_more"):
+            break
+        start_cursor = res.get("next_cursor")
+        if not start_cursor:
+            break
+    return results
+
+# 手動 schema 快取：不快取空 properties（避免你遇到的「空白列」問題反覆發生）
+_DB_PROPS_CACHE: dict[str, tuple[float, dict]] = {}
+_DB_PROPS_TTL = 60.0
+
 # =========================
 # 🛠 部署端 Debug（可在「尚未登入」時使用）
 # 開啟方式：
@@ -199,7 +264,7 @@ def _debug_notion_account_probe(username: str) -> dict:
 
     # DB title + prop types
     try:
-        db = notion.databases.retrieve(database_id=ACCOUNT_DB_ID)
+        db = db_retrieve(database_id=ACCOUNT_DB_ID)
         out["account_db_title"] = "".join([(x.get("plain_text") or "") for x in (db.get("title") or [])]).strip()
         props = (db.get("properties", {}) or {}) if isinstance(db, dict) else {}
         out["account_db_props"] = {k: (v.get("type") if isinstance(v, dict) else None) for k, v in props.items()}
@@ -214,7 +279,7 @@ def _debug_notion_account_probe(username: str) -> dict:
             ("rich_text.equals", {"property": "員工姓名", "rich_text": {"equals": uname}}),
         ]:
             try:
-                res = notion.databases.query(database_id=ACCOUNT_DB_ID, filter=flt, page_size=5)
+                res = db_query(database_id=ACCOUNT_DB_ID, filter=flt, page_size=5)
                 rows = res.get("results", []) if isinstance(res, dict) else []
                 item = {"filter": ftype, "count": len(rows), "page_id": _dbg_safe_id(rows[0].get("id")) if rows else ""}
                 if rows:
@@ -416,7 +481,7 @@ def get_account_page_by_username(username: str) -> dict | None:
     # ✅ 雲端偶爾會因為 schema 讀取失敗而導致查不到帳號（進而「帳號或密碼錯誤」）
     #   這裡改成「不依賴 notion.databases.retrieve」，直接嘗試兩種常見型態的 filter。
     try:
-        res = notion.databases.query(
+        res = db_query(
             database_id=ACCOUNT_DB_ID,
             filter={"property": "員工姓名", "title": {"equals": username}},
             page_size=1,
@@ -428,7 +493,7 @@ def get_account_page_by_username(username: str) -> dict | None:
         pass
 
     try:
-        res = notion.databases.query(
+        res = db_query(
             database_id=ACCOUNT_DB_ID,
             filter={"property": "員工姓名", "rich_text": {"equals": username}},
             page_size=1,
@@ -438,28 +503,62 @@ def get_account_page_by_username(username: str) -> dict | None:
     except Exception:
         return None
 
-@st.cache_data(ttl=60)
-def _get_db_properties_cached(database_id: str) -> dict:
-    """Fetch Notion DB properties (cached 60s)."""
+
+def _normalize_notion_id(raw: str | None) -> str | None:
+    """把 Notion 的 DB/Page ID（可能是 32 碼、帶 dash 的 UUID、或整段網址）統一成 Notion 可吃的 UUID 格式。"""
+    if not raw:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+
+    m = re.search(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", s)
+    if m:
+        return m.group(0).lower()
+
+    m = re.search(r"([0-9a-fA-F]{32})", s)
+    if not m:
+        return None
+
+    h = m.group(1).lower()
+    return f"{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
+
+
+
+def get_db_properties(database_id: str, force_refresh: bool = False, **_kwargs) -> dict:
+    """取得 Notion DB 的 properties（欄位 schema）。
+
+    - 以「DB_ID 正規化 + retrieve REST fallback」確保部署環境穩定
+    - 不快取空 properties（避免短暫權限/連線問題把 {} 快取住，導致後續寫入變成空白列）
+    - 允許 force_refresh=True 強制重抓
+    """
+    dbid = _normalize_notion_id(database_id) or database_id
+    now = time.time()
+
+    if force_refresh:
+        _DB_PROPS_CACHE.pop(dbid, None)
+
+    cached = _DB_PROPS_CACHE.get(dbid)
+    if cached:
+        ts, props = cached
+        if (now - ts) <= _DB_PROPS_TTL and props:
+            return props
+
     try:
-        db = notion.databases.retrieve(database_id=database_id)
-        return db.get("properties", {}) or {}
-    except Exception:
+        db = db_retrieve(dbid)
+        props = db.get("properties", {}) or {}
+        # 不要把空 schema 存進快取
+        if props:
+            _DB_PROPS_CACHE[dbid] = (now, props)
+        return props
+    except Exception as e:
+        if os.getenv("DEBUG_NOTION", "").strip() == "1":
+            st.error(f"❌ Notion 讀取資料庫欄位失敗（{database_id}）：{e}")
         return {}
 
-def get_db_properties(database_id: str, force_refresh: bool = False) -> dict:
-    """Get Notion DB properties with optional force refresh.
 
-    force_refresh=True will bypass Streamlit cache to avoid using a previously cached empty dict.
-    """
-    if force_refresh:
-        try:
-            db = notion.databases.retrieve(database_id=database_id)
-            return db.get("properties", {}) or {}
-        except Exception:
-            return {}
-    return _get_db_properties_cached(database_id)
 
+@st.cache_data(ttl=60)
 def get_select_options(database_id: str, property_name: str) -> list[str]:
     try:
         props = get_db_properties(database_id)
@@ -633,7 +732,7 @@ def has_punch(employee_name: str, d: date, punch_type: str) -> bool:
     start_dt, end_dt = _day_range(d)
 
     try:
-        res = notion.databases.query(
+        res = db_query(
             database_id=PUNCH_DB_ID,
             filter={
                 "and": [
@@ -758,7 +857,7 @@ def list_punch_records(employee_name: str, y: int, m: int, limit: int = 500) -> 
             if next_cursor:
                 q["start_cursor"] = next_cursor
 
-            res = notion.databases.query(**q)
+            res = db_query(**q)
 
             for page in res.get("results", []):
                 props = page.get("properties", {}) or {}
@@ -835,7 +934,7 @@ def list_employee_names(limit: int = 200) -> list[str]:
 
         ptype = (props_meta.get("員工姓名", {}) or {}).get("type")
 
-        res = notion.databases.query(
+        res = db_query(
             database_id=ACCOUNT_DB_ID,
             page_size=min(limit, 100),
         )
@@ -939,7 +1038,7 @@ def count_employee_duty_times(employee_name: str, y: int, m: int, shift_filter: 
             "page_size": 100,
             "filter": {"and": filters},
         }
-        res = notion.databases.query(**q)
+        res = db_query(**q)
         return len(res.get("results", []))
     except Exception:
         return 0
@@ -976,6 +1075,21 @@ def _make_announce_title(content: str, pub_date: date) -> str:
     return f"{pub_date.isoformat()}｜{c or '公告'}"
 
 
+def _norm_prop_name(s: str) -> str:
+    """把欄位名做輕量正規化（去空白/全形空白），避免 Notion 欄位名不小心多了空格導致對不上。"""
+    if s is None:
+        return ""
+    return str(s).replace("\u3000", " ").strip()
+
+
+def _prop_key_map(props_meta: dict) -> dict:
+    """normalized_name -> actual_key"""
+    m = {}
+    for k in (props_meta or {}).keys():
+        m[_norm_prop_name(k)] = k
+    return m
+
+
 def create_announcement(publish_date: date, content: str, end_date: date | None, actor: str = "") -> bool:
     if not ANNOUNCE_DB_ID:
         st.error("❌ 尚未設定 ANNOUNCE_DB_ID（公告紀錄表 Database ID）")
@@ -988,42 +1102,47 @@ def create_announcement(publish_date: date, content: str, end_date: date | None,
 
     try:
         props_meta = get_db_properties(ANNOUNCE_DB_ID) or {}
+        keymap = _prop_key_map(props_meta)
         title_prop = resolve_title_prop_name(ANNOUNCE_DB_ID)  # 自動找 title 欄位
 
         def has_prop(n: str) -> bool:
-            return n in props_meta
+            return _norm_prop_name(n) in keymap
+
+        def key(n: str) -> str:
+            return keymap[_norm_prop_name(n)]
 
         props = {}
 
         # ✅ Title（Notion 必填）
-        if title_prop:
+        if title_prop is not None:
             props[title_prop] = {"title": [{"text": {"content": _make_announce_title(content, publish_date)}}]}
 
         # ✅ 完成情況（預設 False）
         if has_prop("完成情況"):
-            props["完成情況"] = {"checkbox": False}
+            props[key("完成情況")] = {"checkbox": False}
 
         # ✅ 發布日期
         if has_prop("發布日期"):
-            props["發布日期"] = {"date": {"start": datetime.combine(publish_date, datetime.min.time()).isoformat()}}
+            props[key("發布日期")] = {"date": {"start": datetime.combine(publish_date, datetime.min.time()).isoformat()}}
 
         # ✅ 公告內容
         if has_prop("公告內容"):
             # rich_text
-            if (props_meta.get("公告內容", {}) or {}).get("type") == "rich_text":
-                props["公告內容"] = {"rich_text": [{"text": {"content": content}}]}
+            actual = key("公告內容")
+            if (props_meta.get(actual, {}) or {}).get("type") == "rich_text":
+                props[actual] = {"rich_text": [{"text": {"content": content}}]}
             # 也有人把公告內容做成 title（就當備援）
-            elif (props_meta.get("公告內容", {}) or {}).get("type") == "title":
-                props["公告內容"] = {"title": [{"text": {"content": content}}]}
+            elif (props_meta.get(actual, {}) or {}).get("type") == "title":
+                props[actual] = {"title": [{"text": {"content": content}}]}
             else:
                 # 保底：仍用 rich_text 方式寫
-                props["公告內容"] = {"rich_text": [{"text": {"content": content}}]}
+                props[actual] = {"rich_text": [{"text": {"content": content}}]}
 
         # ✅ 結束時間（可空）
         if end_date and has_prop("結束時間"):
-            props["結束時間"] = {"date": {"start": datetime.combine(end_date, datetime.min.time()).isoformat()}}
+            props[key("結束時間")] = {"date": {"start": datetime.combine(end_date, datetime.min.time()).isoformat()}}
 
-        notion.pages.create(parent={"database_id": ANNOUNCE_DB_ID}, properties=props)
+        notion.pages.create(parent={"database_id": (_normalize_notion_id(ANNOUNCE_DB_ID) or ANNOUNCE_DB_ID)}, properties=props)
         log_action(actor or "—", "公告管理", f"新增公告：{publish_date.isoformat()}｜{content[:30]}", "成功")
         return True
 
@@ -1135,7 +1254,7 @@ def list_announcements(include_hidden: bool, limit: int = 200) -> list[dict]:
             filters = [{"and": and_list}]
 
     query = {
-        "database_id": ANNOUNCE_DB_ID,
+        "database_id": (_normalize_notion_id(ANNOUNCE_DB_ID) or ANNOUNCE_DB_ID),
         "page_size": 100,
         "sorts": [{"property": "發布日期", "direction": "descending"}] if "發布日期" in props_meta else [{"timestamp": "created_time", "direction": "descending"}],
     }
@@ -1148,7 +1267,7 @@ def list_announcements(include_hidden: bool, limit: int = 200) -> list[dict]:
         while True:
             if next_cursor:
                 query["start_cursor"] = next_cursor
-            res = notion.databases.query(**query)
+            res = db_query(**query)
             for page in res.get("results", []):
                 rows.append(_extract_announce_row(page))
                 if len(rows) >= int(limit):
@@ -1222,7 +1341,7 @@ def query_duty_rows_from_notion(y: int, m: int) -> list[dict]:
         filters.append({"property": k_month, "number": {"equals": int(m)}})
 
     try:
-        res = notion.databases.query(
+        res = db_query(
             database_id=DUTY_DB_ID,
             page_size=200,
             filter={"and": filters} if filters else None,
@@ -1274,89 +1393,59 @@ def query_duty_rows_from_notion(y: int, m: int) -> list[dict]:
 
 
 def export_duty_excel_bytes(y: int, m: int, rows: list[dict]) -> bytes:
-    """輸出值班表檔案 bytes。
+    """輸出成你參考圖那種橫向班表（簡化版：可再加顏色/合併儲存格）。"""
+    from io import BytesIO
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, Border, Side
+    from openpyxl.utils import get_column_letter
 
-    - 優先輸出 .xlsx（需 openpyxl）。
-    - 若部署環境沒有 openpyxl（Streamlit Cloud 常見），則自動降級輸出 .csv（仍回傳 bytes）。
-      這樣就不會因為缺套件導致整個 App 直接炸掉、連登入都進不去。
-    """
-    from io import BytesIO, TextIOWrapper
-    import csv
+    wb = Workbook()
+    ws = wb.active
+    ws.title = f"{m:02d}月值班表"
 
-    # -------------------------
-    # 1) 有 openpyxl -> 輸出 xlsx
-    # -------------------------
-    try:
-        from openpyxl import Workbook  # type: ignore
-        from openpyxl.styles import Alignment, Font, Border, Side  # type: ignore
-        from openpyxl.utils import get_column_letter  # type: ignore
+    title = f"{y}年{m}月份值班表"
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(DUTY_COLUMNS))
+    ws.cell(row=1, column=1, value=title).font = Font(size=16, bold=True)
+    ws.cell(row=1, column=1).alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 26
 
-        wb = Workbook()
-        ws = wb.active
-        ws.title = f"{m:02d}月值班表"
+    # header
+    for c, name in enumerate(DUTY_COLUMNS, start=1):
+        cell = ws.cell(row=2, column=c, value=name)
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-        title = f"{y}年{m}月份值班表"
-        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(DUTY_COLUMNS))
-        ws.cell(row=1, column=1, value=title).font = Font(size=16, bold=True)
-        ws.cell(row=1, column=1).alignment = Alignment(horizontal="center", vertical="center")
-        ws.row_dimensions[1].height = 26
+    thin = Side(style="thin")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-        # header
+    # body
+    for i, r in enumerate(rows, start=3):
         for c, name in enumerate(DUTY_COLUMNS, start=1):
-            cell = ws.cell(row=2, column=c, value=name)
-            cell.font = Font(bold=True)
+            v = r.get(name, "")
+            if isinstance(v, list):
+                v = "、".join(v)
+            cell = ws.cell(row=i, column=c, value=v)
             cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.border = border
 
-        thin = Side(style="thin")
-        border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    # column widths（你可再微調成更像參考圖）
+    widths = {
+        "日期": 6,
+        "星期": 6,
+        "檢驗線(中)": 16,
+        "檢驗線(晚)": 16,
+        "收費員(中)": 16,
+        "收費員(晚)": 16,
+        "打掃工作": 14,
+        "備註": 18,
+    }
+    for i, name in enumerate(DUTY_COLUMNS, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = widths.get(name, 14)
 
-        # body
-        for i, r in enumerate(rows, start=3):
-            for c, name in enumerate(DUTY_COLUMNS, start=1):
-                v = r.get(name, "")
-                if isinstance(v, list):
-                    v = "、".join([str(x) for x in v])
-                cell = ws.cell(row=i, column=c, value=v)
-                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-                cell.border = border
-
-        # column widths
-        widths = {
-            "日期": 6,
-            "星期": 6,
-            "檢驗線(中)": 16,
-            "檢驗線(晚)": 16,
-            "收費員(中)": 16,
-            "收費員(晚)": 16,
-            "打掃工作": 14,
-            "備註": 18,
-        }
-        for i, name in enumerate(DUTY_COLUMNS, start=1):
-            ws.column_dimensions[get_column_letter(i)].width = widths.get(name, 14)
-
-        bio = BytesIO()
-        wb.save(bio)
-        return bio.getvalue()
-
-    except ModuleNotFoundError:
-        pass
-    except Exception:
-        # 任何 openpyxl 相關輸出錯誤，都降級 CSV，避免整個 App 失效
-        pass
-
-    # -------------------------
-    # 2) 沒 openpyxl -> 降級輸出 CSV（Excel 仍可直接開）
-    # -------------------------
     bio = BytesIO()
-    tw = TextIOWrapper(bio, encoding="utf-8-sig", newline="")
-    w = csv.writer(tw)
-
-    w.writerow(DUTY_COLUMNS)
-    for r in rows:
-        w.writerow([r.get(col, "") for col in DUTY_COLUMNS])
-
-    tw.flush()
+    wb.save(bio)
     return bio.getvalue()
+
 def _norm_prop_name(s: str) -> str:
     """把欄位名稱正規化：去空白、全形括號轉半形，避免 Notion 欄名些微差異造成找不到。"""
     if s is None:
@@ -1667,7 +1756,7 @@ def get_overtime_rule(y: int, m: int) -> dict:
     if not OVERTIME_RULE_DB_ID:
         return {"shift_hours": 0.0, "hourly_rate": 0.0}
 
-    res = notion.databases.query(
+    res = db_query(
         database_id=OVERTIME_RULE_DB_ID,
         page_size=5,
         filter={
@@ -1723,7 +1812,7 @@ def get_overtime_count_hours(employee: str, y: int, m: int) -> float:
                 {"property": k_emp, "title": {"equals": employee}},
             ]
         }
-        res = notion.databases.query(database_id=OVERTIME_COUNT_DB_ID, page_size=5, filter=flt)
+        res = db_query(database_id=OVERTIME_COUNT_DB_ID, page_size=5, filter=flt)
         results = (res or {}).get("results", []) or []
         if not results:
             return 0.0
@@ -1758,7 +1847,7 @@ def upsert_overtime_count_to_notion(employee: str, y: int, m: int, hours: float,
                 {"property": k_emp, "title": {"equals": employee}},
             ]
         }
-        res = notion.databases.query(database_id=OVERTIME_COUNT_DB_ID, page_size=5, filter=flt)
+        res = db_query(database_id=OVERTIME_COUNT_DB_ID, page_size=5, filter=flt)
         results = (res or {}).get("results", []) or []
         page_id = results[0]["id"] if results else None
 
@@ -2000,7 +2089,7 @@ def upsert_duty_rows_to_notion(y: int, m: int, rows: list[dict]) -> None:
                 else {"property": "日期", "rich_text": {"equals": date_str}}
             )
 
-            res = notion.databases.query(
+            res = db_query(
                 database_id=DUTY_DB_ID,
                 page_size=5,
                 filter={
@@ -2138,7 +2227,7 @@ def upsert_overtime_rule_to_notion(
         payload[note_prop] = _set(note_prop, note or "")
 
     # 查詢同年同月既有 page
-    res = notion.databases.query(
+    res = db_query(
         database_id=dbid,
         page_size=1,
         filter={
@@ -2379,7 +2468,7 @@ def list_operation_logs(limit: int = 200):
             "page_size": min(int(limit), 100),
             "sorts": sorts,
         }
-        res = notion.databases.query(**query)
+        res = db_query(**query)
 
         def fmt_time(s: str) -> str:
             if not s:
@@ -2699,7 +2788,7 @@ def get_cashout_rule_by_year(year: int) -> dict | None:
         return None
 
     try:
-        res = notion.databases.query(
+        res = db_query(
             database_id=CASHOUT_RULE_DB_ID,
             filter={"property": "年份", "number": {"equals": int(year)}},
             page_size=1,
@@ -2884,7 +2973,7 @@ def list_leave_requests(is_admin: bool, employee_name: str, limit: int = 50):
         if not is_admin:
             query["filter"] = {"property": "員工姓名", "title": {"equals": employee_name}}
 
-        res = notion.databases.query(**query)
+        res = db_query(**query)
         rows = []
 
         for page in res.get("results", []):
@@ -2909,7 +2998,7 @@ def list_leave_requests(is_admin: bool, employee_name: str, limit: int = 50):
 
             rows.append({
                 "_page_id": page["id"],
-                "員工姓名": get_text("員工姓名"),
+                "員工姓名": get_title("員工姓名"),
                 "假別": get_select("假別"),
                 "請假時數": get_number("請假時數"),
                 "請假期間": period_display,
@@ -2939,7 +3028,7 @@ def calc_used_vacation_hours(employee_name: str, year: int) -> float:
     approved_status = next((c for c in approved_candidates if c in status_options), None) or "通過"
 
     try:
-        res = notion.databases.query(
+        res = db_query(
             database_id=LEAVE_DB_ID,
             filter={
                 "and": [
@@ -2974,7 +3063,7 @@ def calc_used_vacation_hours(employee_name: str, year: int) -> float:
 # =========================
 def list_employee_names(limit: int = 200):
     try:
-        res = notion.databases.query(database_id=ACCOUNT_DB_ID, page_size=min(limit, 100))
+        res = db_query(database_id=ACCOUNT_DB_ID, page_size=min(limit, 100))
         names = []
         for page in res.get("results", []):
             props = page["properties"]
@@ -3008,7 +3097,7 @@ def list_vacation_summary(is_admin: bool, employee_name: str, year: int | None =
         if filters:
             query["filter"] = {"and": filters} if len(filters) > 1 else filters[0]
 
-        res = notion.databases.query(**query)
+        res = db_query(**query)
         rows = []
 
         for page in res.get("results", []):
@@ -3050,7 +3139,7 @@ def ensure_vacation_row(employee_name: str, year: int, default_total: float = 0.
         return False
 
     try:
-        res = notion.databases.query(
+        res = db_query(
             database_id=VACATION_DB_ID,
             filter={
                 "and": [
@@ -3154,7 +3243,7 @@ def get_salary_record(employee_name: str, y: int, m: int) -> dict | None:
         return None
 
     try:
-        res = notion.databases.query(
+        res = db_query(
             database_id=SALARY_DB_ID,
             filter={
                 "and": [
@@ -3268,7 +3357,7 @@ def get_salary_record(employee_name: str, y: int, m: int) -> dict | None:
 
         data = {
             "_page_id": page.get("id"),
-            "員工姓名": get_text("員工姓名"),
+            "員工姓名": get_title("員工姓名"),
             "薪資年份": int(get_number("薪資年份") or 0),
             "薪資月份": int(get_number("薪資月份") or 0),
             "備註": get_rich_text("備註"),
@@ -3569,7 +3658,7 @@ def list_salary_records(is_admin: bool, employee_name: str, y: int | None = None
         if filters:
             query["filter"] = {"and": filters} if len(filters) > 1 else filters[0]
 
-        res = notion.databases.query(**query)
+        res = db_query(**query)
 
         rows = []
         for page in res.get("results", []):
@@ -3743,14 +3832,6 @@ def make_excel_bytes(rows: list[dict], filename_hint: str = "salary.xlsx") -> tu
 # ✅ 出勤記錄表
 # ============================================================
 def create_attendance_record(employee_name: str, attend_date: date, status: str, actor: str = "") -> bool:
-    """新增/更新一筆【出勤記錄表】（Query 邏輯）。
-
-    ✅ 行為：
-    - 先用 databases.query 找「同員工 + 同日期」是否已存在
-      - 有：pages.update 更新出勤狀態
-      - 無：pages.create 新增
-    - **若解析不到必要欄位，就直接報錯並停止**（避免建立空白列）
-    """
     if not ATTEND_DB_ID:
         st.error("❌ 尚未設定 ATTEND_DB_ID（出勤記錄表 Database ID）")
         return False
@@ -3762,82 +3843,38 @@ def create_attendance_record(employee_name: str, attend_date: date, status: str,
         return False
 
     try:
-        props_meta = get_db_properties(ATTEND_DB_ID) or {}
+        props_meta = get_db_properties(ATTEND_DB_ID)
 
-        # 1) 解析欄位 key（容錯）
-        title_key = resolve_title_prop(ATTEND_DB_ID)
-        name_key = resolve_prop_key(props_meta, "員工姓名") or title_key
-        date_key = resolve_prop_key(props_meta, "出勤日期")
-        status_key = resolve_prop_key(props_meta, "出勤狀態")
+        def has_prop(n: str) -> bool:
+            return n in (props_meta or {})
 
-        missing = []
-        if not title_key:
-            missing.append("Title(type=title)")
-        if not name_key:
-            missing.append("員工姓名")
-        if not date_key:
-            missing.append("出勤日期")
-        if not status_key:
-            missing.append("出勤狀態")
-        if missing:
-            raise RuntimeError(f"出勤記錄表缺少必要欄位：{', '.join(missing)}（請確認 DB 欄位/Integration 共享）")
+        props = {}
+        if has_prop("員工姓名"):
+            props["員工姓名"] = {"title": [{"text": {"content": employee_name}}]}
+        if has_prop("出勤日期"):
+            props["出勤日期"] = {"date": {"start": datetime.combine(attend_date, datetime.min.time()).isoformat()}}
+        if has_prop("出勤狀態"):
+            # ✅ 預設選項：出席/請假/遲到（若你 Notion 已建好，就會用你 Notion 的）
+            options = get_select_options(ATTEND_DB_ID, "出勤狀態") or [ATTEND_PRESENT_STATUS, ATTEND_LEAVE_STATUS, ATTEND_LATE_STATUS]
+            if status in options:
+                props["出勤狀態"] = {"select": {"name": status}}
+            else:
+                st.error(f"❌ 出勤狀態 Notion 選項不存在：{status}（請先在 Notion 建立選項）")
+                return False
 
-        # 2) Query：同員工 + 同日期
-        filters = {"and": []}
-
-        # 名稱：依欄位型態建立 equals filter（title/rich_text）
-        f_name = _equals_filter_by_type(props_meta, name_key, employee_name)
-        if f_name:
-            filters["and"].append(f_name)
-
-        # 日期：date equals
-        filters["and"].append({"property": date_key, "date": {"equals": attend_date.isoformat()}})
-
-        res = notion.databases.query(database_id=ATTEND_DB_ID, page_size=5, filter=filters)
-        results = (res or {}).get("results", []) or []
-
-        # 3) 組 properties payload（給 create / update）
-        upd_props: dict = {}
-
-        # 出勤狀態（select / status）
-        st_meta = (props_meta or {}).get(status_key, {}) or {}
-        if st_meta.get("type") == "status":
-            upd_props[status_key] = {"status": {"name": status}}
-        else:
-            upd_props[status_key] = {"select": {"name": status}}
-
-        if results:
-            page_id = results[0].get("id")
-            notion.pages.update(page_id=page_id, properties=upd_props)
-        else:
-            create_props: dict = {}
-
-            # Title 必填：用員工姓名當 title
-            create_props[title_key] = {"title": [{"text": {"content": employee_name}}]}
-
-            # 員工姓名（若不是同一欄位，補寫）
-            if name_key != title_key:
-                _best_set_text(create_props, props_meta, name_key, employee_name)
-
-            # 出勤日期
-            create_props[date_key] = {"date": {"start": attend_date.isoformat()}}
-
-            # 出勤狀態
-            create_props.update(upd_props)
-
-            if not create_props:
-                raise RuntimeError("出勤記錄表 properties 產生失敗（空 dict），已阻止建立空白列")
-
-            notion.pages.create(parent={"database_id": ATTEND_DB_ID}, properties=create_props)
-
+        notion.pages.create(parent={"database_id": ATTEND_DB_ID}, properties=props)
         log_action(actor or "—", "出勤新增", f"{employee_name}｜{attend_date.isoformat()}｜{status}", "成功")
         return True
 
     except Exception as e:
         st.error(f"寫入出勤失敗：{e}")
-        log_action(actor or "—", "出勤新增", f"寫入出勤失敗：{e}", "系統錯誤")
+        log_action(actor or "—", "出勤新增", f"寫入失敗：{e}", "系統錯誤")
         return False
 
+@st.cache_data(ttl=60)
+# ============================================================
+# ✅ 出勤記錄表（查詢 / 更新）
+# ============================================================
 def _attend_day_range(attend_date: date) -> tuple[str, str]:
     """回傳 Notion date filter 用的 [start_iso, end_iso) 區間（以該日 00:00:00 起算）。"""
     start_dt = datetime.combine(attend_date, datetime.min.time())
@@ -3846,10 +3883,7 @@ def _attend_day_range(attend_date: date) -> tuple[str, str]:
 
 
 def find_attendance_page(employee_name: str, attend_date: date) -> str | None:
-    """找出【同一員工 + 同一天】是否已存在出勤紀錄，回傳 page_id 或 None。
-
-    ✅ 改成 Query 邏輯：員工姓名欄位可能是 title 或 rich_text，不再硬寫 title filter。
-    """
+    """用『員工姓名(Title)+出勤日期(Date)』找出當日是否已存在出勤紀錄，回傳 page_id 或 None。"""
     if not ATTEND_DB_ID:
         return None
 
@@ -3858,61 +3892,28 @@ def find_attendance_page(employee_name: str, attend_date: date) -> str | None:
         return None
 
     try:
-        props_meta = get_db_properties(ATTEND_DB_ID)
         start_iso, end_iso = _attend_day_range(attend_date)
-
-        name_filter = None
-        if "員工姓名" in (props_meta or {}):
-            name_filter = _equals_filter_by_type(props_meta, "員工姓名", employee_name)
-
-        base_filters = [
-            {"property": "出勤日期", "date": {"on_or_after": start_iso}},
-            {"property": "出勤日期", "date": {"before": end_iso}},
-        ]
-
-        # 能用 filter 就用 filter（省流量）
-        if name_filter:
-            res = db_query(
-                database_id=ATTEND_DB_ID,
-                page_size=5,
-                filter={"and": [name_filter, *base_filters]},
-            )
-            results = (res or {}).get("results") or []
-            if results:
-                return results[0].get("id")
-            return None
-
-        # 否則：只用日期範圍查出當天全部，再用程式比對姓名（最穩）
         res = db_query(
             database_id=ATTEND_DB_ID,
-            page_size=100,
-            filter={"and": base_filters},
+            page_size=1,
+            filter={
+                "and": [
+                    {"property": "員工姓名", "title": {"equals": employee_name}},
+                    {"property": "出勤日期", "date": {"on_or_after": start_iso}},
+                    {"property": "出勤日期", "date": {"before": end_iso}},
+                ]
+            },
         )
         results = (res or {}).get("results") or []
-
-        for p in results:
-            props = (p.get("properties") or {})
-            name_prop = props.get("員工姓名", {}) or {}
-            ptype = name_prop.get("type")
-            if ptype == "title":
-                nm = (_title_get_first_plain_text(name_prop) or "").strip()
-            elif ptype == "rich_text":
-                nm = (_get_prop_plain_text(name_prop) or "").strip()
-            else:
-                nm = ((_title_get_first_plain_text(name_prop) or _get_prop_plain_text(name_prop) or "").strip())
-            if nm == employee_name:
-                return p.get("id")
-
+        if results:
+            return results[0].get("id")
         return None
     except Exception:
         return None
 
 
 def upsert_attendance_record(employee_name: str, attend_date: date, status: str, actor: str = "") -> bool:
-    """同日同人：有就更新、沒有就新增（出勤記錄表）。
-
-    ✅ 改成 Query 邏輯：員工姓名欄位可能是 title 或 rich_text，不再硬寫 title。
-    """
+    """同日同人：有就更新、沒有就新增。"""
     if not ATTEND_DB_ID:
         st.error("❌ 尚未設定 ATTEND_DB_ID（出勤記錄表 Database ID）")
         return False
@@ -3924,49 +3925,26 @@ def upsert_attendance_record(employee_name: str, attend_date: date, status: str,
         return False
 
     try:
-        props_meta = get_db_properties(ATTEND_DB_ID, force_refresh=True)
+        props_meta = get_db_properties(ATTEND_DB_ID)
 
-        # 驗證狀態選項（select/status）
-        if "出勤狀態" in (props_meta or {}):
-            meta = (props_meta or {}).get("出勤狀態", {}) or {}
-            t = meta.get("type")
-            options = []
-            if t == "select":
-                options = get_select_options(ATTEND_DB_ID, "出勤狀態") or []
-            elif t == "status":
-                options = [o.get("name") for o in (meta.get("status", {}).get("options", []) or []) if o.get("name")]
-            if options and (status not in options):
-                st.error(f"❌ 出勤狀態 Notion 選項不存在：{status}（請先在 Notion 建立選項）")
-                return False
+        def has_prop(n: str) -> bool:
+            return n in (props_meta or {})
+
+        # 驗證狀態選項
+        options = get_select_options(ATTEND_DB_ID, "出勤狀態") or [ATTEND_PRESENT_STATUS, ATTEND_LEAVE_STATUS, ATTEND_LATE_STATUS]
+        if status not in options:
+            st.error(f"❌ 出勤狀態 Notion 選項不存在：{status}（請先在 Notion 建立選項）")
+            return False
 
         page_id = find_attendance_page(employee_name, attend_date)
 
-        props: dict = {}
-
-        # 若為新增，才需要寫入員工姓名（更新不一定要動它）
-        if not page_id:
-            if "員工姓名" in (props_meta or {}):
-                _best_set_text(props, props_meta, "員工姓名", employee_name)
-            else:
-                tname = _first_title_prop_name(props_meta)
-                if tname:
-                    _best_set_text(props, props_meta, tname, employee_name)
-
-        if "出勤日期" in (props_meta or {}):
-            props["出勤日期"] = {
-                "date": {"start": datetime.combine(attend_date, datetime.min.time()).isoformat()}
-            }
-
-        if "出勤狀態" in (props_meta or {}):
-            meta = (props_meta or {}).get("出勤狀態", {}) or {}
-            t = meta.get("type")
-            if t == "status":
-                props["出勤狀態"] = {"status": {"name": status}}
-            else:
-                props["出勤狀態"] = {"select": {"name": status}}
-
-        if not props:
-            raise RuntimeError("Notion properties 組裝結果為空（請確認出勤記錄表欄位名稱/Integration 權限）")
+        props = {}
+        if has_prop("員工姓名") and (not page_id):
+            props["員工姓名"] = {"title": [{"text": {"content": employee_name}}]}
+        if has_prop("出勤日期"):
+            props["出勤日期"] = {"date": {"start": datetime.combine(attend_date, datetime.min.time()).isoformat()}}
+        if has_prop("出勤狀態"):
+            props["出勤狀態"] = {"select": {"name": status}}
 
         if page_id:
             notion.pages.update(page_id=page_id, properties=props)
@@ -3981,7 +3959,6 @@ def upsert_attendance_record(employee_name: str, attend_date: date, status: str,
         st.error(f"寫入出勤失敗：{e}")
         log_action(actor or "—", "出勤寫入", f"寫入失敗：{e}", "系統錯誤")
         return False
-
 
 
 def get_attendance_status_map_by_date(attend_date: date) -> dict[str, str]:
@@ -4014,7 +3991,7 @@ def get_attendance_status_map_by_date(attend_date: date) -> dict[str, str]:
             return (((p.get("select") or {}).get("name")) or "").strip()
 
         while True:
-            res = notion.databases.query(
+            res = db_query(
                 database_id=ATTEND_DB_ID,
                 page_size=100,
                 start_cursor=cursor,
@@ -4060,14 +4037,8 @@ def list_attendance_records(start_d: date, end_d: date, employee_name: str | Non
             {"property": "出勤日期", "date": {"on_or_after": datetime.combine(start_d, datetime.min.time()).isoformat()}},
             {"property": "出勤日期", "date": {"before": datetime.combine(end_d, datetime.min.time()).isoformat()}},
         ]
-        # ✅ 員工姓名欄位可能是 title 或 rich_text：用 schema 自動選 filter；不支援時就改成查完再程式過濾
-        emp_filter = None
         if emp and emp != "全部員工":
-            props_meta = get_db_properties(ATTEND_DB_ID)
-            if "員工姓名" in (props_meta or {}):
-                emp_filter = _equals_filter_by_type(props_meta, "員工姓名", emp)
-            if emp_filter:
-                filters.insert(0, emp_filter)
+            filters.insert(0, {"property": "員工姓名", "title": {"equals": emp}})
 
         query = {
             "database_id": ATTEND_DB_ID,
@@ -4083,20 +4054,14 @@ def list_attendance_records(start_d: date, end_d: date, employee_name: str | Non
             if next_cursor:
                 query["start_cursor"] = next_cursor
 
-            res = notion.databases.query(**query)
+            res = db_query(**query)
 
             for page in res.get("results", []):
                 props = page["properties"]
 
-                def get_text(name: str) -> str:
-                    p = props.get(name, {}) or {}
-                    t = p.get("type")
-                    if t == "title":
-                        return (_title_get_first_plain_text(p) or "")
-                    if t == "rich_text":
-                        return (_get_prop_plain_text(p) or "")
-                    # fallback
-                    return (_title_get_first_plain_text(p) or _get_prop_plain_text(p) or "")
+                def get_title(name):
+                    v = props.get(name, {}).get("title", [])
+                    return v[0]["plain_text"] if v else ""
 
                 def get_select(name):
                     p = props.get(name, {}) or {}
@@ -4123,13 +4088,9 @@ def list_attendance_records(start_d: date, end_d: date, employee_name: str | Non
                     except Exception:
                         return d.get("start", "")
 
-                emp_name_row = get_text("員工姓名").strip()
-                if emp and emp != "全部員工" and (not emp_filter) and emp_name_row != emp:
-                    continue
-
                 rows.append({
                     "_page_id": page["id"],
-                    "員工姓名": emp_name_row,
+                    "員工姓名": get_title("員工姓名"),
                     "出勤日期": get_date_only("出勤日期"),
                     "出勤狀態": get_select("出勤狀態"),
                     "建立時間": props.get("建立時間", {}).get("created_time", ""),
@@ -4213,7 +4174,7 @@ def _list_lunch_eligible_attendance_days(employee_name: str, start_d: date, end_
             if next_cursor:
                 query["start_cursor"] = next_cursor
 
-            res = notion.databases.query(**query)
+            res = db_query(**query)
 
             for page in res.get("results", []):
                 props = page.get("properties", {}) or {}
@@ -4275,13 +4236,12 @@ def calc_working_days_for_lunch(employee_name: str, y: int, m: int) -> tuple[int
     return len(working_list), working_list
 
 
-def create_lunch_record(employee_name: str, amount: float, order_date: date, actor: str = "") -> bool:
-    """新增一筆【午餐訂餐表】。
-
-    ✅ 重點修正：
-    - **永遠不在 properties 為空時建立 page**（避免出現「建立時間有、其他欄位全空白」的假成功列）
-    - 以「Query/Schema 容錯」方式解析欄位 key（支援欄位名稱些微差異）
-    - Title 欄位不再硬抓「員工姓名」：自動取資料庫的 title 欄位（Notion 必填）
+def create_lunch_record(employee_name: str, lunch_date: date, amount: float, actor: str = "") -> bool:
+    """
+    午餐訂餐表欄位（依你截圖）：
+      - 員工姓名 (title)
+      - 訂餐金額 (number)
+      - 訂餐日期 (date)
     """
     if not LUNCH_DB_ID:
         st.error("❌ 尚未設定 LUNCH_DB_ID（午餐訂餐表 Database ID）")
@@ -4293,53 +4253,26 @@ def create_lunch_record(employee_name: str, amount: float, order_date: date, act
         return False
 
     try:
-        props_meta = get_db_properties(LUNCH_DB_ID) or {}
+        props_meta = get_db_properties(LUNCH_DB_ID)
 
-        # 1) 解析欄位 key（容錯比對）
-        title_key = resolve_title_prop(LUNCH_DB_ID)  # 真正 type=title 的欄位名
-        name_key = resolve_prop_key(props_meta, "員工姓名") or title_key
-        amt_key = resolve_prop_key(props_meta, "訂餐金額")
-        date_key = resolve_prop_key(props_meta, "訂餐日期")
+        def has_prop(n: str) -> bool:
+            return n in (props_meta or {})
 
-        # 2) 必要欄位檢查（少任何一個就不要建立 page，避免空白列）
-        missing = []
-        if not title_key:
-            missing.append("Title(type=title)")
-        if not name_key:
-            missing.append("員工姓名")
-        if not amt_key:
-            missing.append("訂餐金額")
-        if not date_key:
-            missing.append("訂餐日期")
-        if missing:
-            raise RuntimeError(f"午餐訂餐表缺少必要欄位：{', '.join(missing)}（請確認 DB 欄位/Integration 共享）")
-
-        props: dict = {}
-
-        # 3) Title（Notion 必填）→ 用員工姓名當 title（穩定又好查）
-        props[title_key] = {"title": [{"text": {"content": employee_name}}]}
-
-        # 4) 員工姓名（如果不是同一個 title 欄位，就再寫一份到該欄位）
-        if name_key != title_key:
-            _best_set_text(props, props_meta, name_key, employee_name)
-
-        # 5) 訂餐金額
-        props[amt_key] = {"number": float(amount)}
-
-        # 6) 訂餐日期
-        props[date_key] = {"date": {"start": datetime.combine(order_date, datetime.min.time()).isoformat()}}
-
-        # ✅ 最後保險：避免空 props 造成空白列
-        if not props:
-            raise RuntimeError("午餐訂餐表 properties 產生失敗（空 dict），已阻止建立空白列")
+        props = {}
+        if has_prop("員工姓名"):
+            props["員工姓名"] = {"title": [{"text": {"content": employee_name}}]}
+        if has_prop("訂餐金額"):
+            props["訂餐金額"] = {"number": float(amount or 0)}
+        if has_prop("訂餐日期"):
+            props["訂餐日期"] = {"date": {"start": datetime.combine(lunch_date, datetime.min.time()).isoformat()}}
 
         notion.pages.create(parent={"database_id": LUNCH_DB_ID}, properties=props)
-        log_action(actor or "—", "午餐訂餐", f"{employee_name}｜{order_date.isoformat()}｜${amount}", "成功")
+        log_action(actor or employee_name, "午餐訂餐", f"{employee_name}｜{lunch_date.isoformat()}｜${float(amount or 0):.0f}", "成功")
         return True
 
     except Exception as e:
-        st.error(f"新增午餐訂餐失敗：{e}")
-        log_action(actor or "—", "午餐訂餐", f"新增午餐訂餐失敗：{e}", "系統錯誤")
+        st.error(f"寫入午餐訂餐失敗：{e}")
+        log_action(actor or employee_name, "午餐訂餐", f"寫入失敗：{e}", "系統錯誤")
         return False
 
 
@@ -4378,7 +4311,7 @@ def list_lunch_records(is_admin: bool, employee_name: str, start_d: date, end_d:
             "filter": {"and": filters} if len(filters) > 1 else filters[0],
         }
 
-        res = notion.databases.query(**query)
+        res = db_query(**query)
 
         rows = []
         for page in res.get("results", []):
