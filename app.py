@@ -2902,7 +2902,7 @@ def list_leave_requests(is_admin: bool, employee_name: str, limit: int = 50):
 
             rows.append({
                 "_page_id": page["id"],
-                "員工姓名": get_title("員工姓名"),
+                "員工姓名": get_text("員工姓名"),
                 "假別": get_select("假別"),
                 "請假時數": get_number("請假時數"),
                 "請假期間": period_display,
@@ -3261,7 +3261,7 @@ def get_salary_record(employee_name: str, y: int, m: int) -> dict | None:
 
         data = {
             "_page_id": page.get("id"),
-            "員工姓名": get_title("員工姓名"),
+            "員工姓名": get_text("員工姓名"),
             "薪資年份": int(get_number("薪資年份") or 0),
             "薪資月份": int(get_number("薪資月份") or 0),
             "備註": get_rich_text("備註"),
@@ -3736,6 +3736,9 @@ def make_excel_bytes(rows: list[dict], filename_hint: str = "salary.xlsx") -> tu
 # ✅ 出勤記錄表
 # ============================================================
 def create_attendance_record(employee_name: str, attend_date: date, status: str, actor: str = "") -> bool:
+    """新增一筆【出勤記錄表】。
+    ✅ 改為「Query 邏輯」同款的 schema 容錯：不再硬寫 title，而是依資料庫欄位型態（title / rich_text）自動組 payload。
+    """
     if not ATTEND_DB_ID:
         st.error("❌ 尚未設定 ATTEND_DB_ID（出勤記錄表 Database ID）")
         return False
@@ -3747,24 +3750,53 @@ def create_attendance_record(employee_name: str, attend_date: date, status: str,
         return False
 
     try:
-        props_meta = get_db_properties(ATTEND_DB_ID)
+        # ✅ 強制重抓 schema：避免曾快取到空 properties
+        props_meta = get_db_properties(ATTEND_DB_ID, force_refresh=True)
 
-        def has_prop(n: str) -> bool:
-            return n in (props_meta or {})
+        props: dict = {}
 
-        props = {}
-        if has_prop("員工姓名"):
-            props["員工姓名"] = {"title": [{"text": {"content": employee_name}}]}
-        if has_prop("出勤日期"):
-            props["出勤日期"] = {"date": {"start": datetime.combine(attend_date, datetime.min.time()).isoformat()}}
-        if has_prop("出勤狀態"):
-            # ✅ 預設選項：出席/請假/遲到（若你 Notion 已建好，就會用你 Notion 的）
-            options = get_select_options(ATTEND_DB_ID, "出勤狀態") or [ATTEND_PRESENT_STATUS, ATTEND_LEAVE_STATUS, ATTEND_LATE_STATUS]
-            if status in options:
-                props["出勤狀態"] = {"select": {"name": status}}
-            else:
-                st.error(f"❌ 出勤狀態 Notion 選項不存在：{status}（請先在 Notion 建立選項）")
-                return False
+        # 1) 員工姓名：依欄位型態自動寫入（title / rich_text）
+        if "員工姓名" in (props_meta or {}):
+            _best_set_text(props, props_meta, "員工姓名", employee_name)
+        else:
+            # fallback：找 DB 裡的 title 欄位名稱（理論上一定有）
+            tname = _first_title_prop_name(props_meta)
+            if tname:
+                _best_set_text(props, props_meta, tname, employee_name)
+
+        # 2) 出勤日期
+        if "出勤日期" in (props_meta or {}):
+            props["出勤日期"] = {
+                "date": {"start": datetime.combine(attend_date, datetime.min.time()).isoformat()}
+            }
+
+        # 3) 出勤狀態（select / status）
+        if "出勤狀態" in (props_meta or {}):
+            meta = (props_meta or {}).get("出勤狀態", {}) or {}
+            t = meta.get("type")
+            if t in ("select", "status"):
+                # 先做選項驗證（有 options 就驗證，拿不到就直接寫入交給 Notion 驗）
+                options = []
+                try:
+                    if t == "select":
+                        options = get_select_options(ATTEND_DB_ID, "出勤狀態") or []
+                    elif t == "status":
+                        options = [o.get("name") for o in (meta.get("status", {}).get("options", []) or []) if o.get("name")]
+                except Exception:
+                    options = []
+
+                if options and (status not in options):
+                    st.error(f"❌ 出勤狀態 Notion 選項不存在：{status}（請先在 Notion 建立選項）")
+                    return False
+
+                if t == "status":
+                    props["出勤狀態"] = {"status": {"name": status}}
+                else:
+                    props["出勤狀態"] = {"select": {"name": status}}
+
+        # ✅ 真的要寫入的 properties 不可為空
+        if not props:
+            raise RuntimeError("Notion properties 組裝結果為空（請確認出勤記錄表欄位名稱/Integration 權限）")
 
         notion.pages.create(parent={"database_id": ATTEND_DB_ID}, properties=props)
         log_action(actor or "—", "出勤新增", f"{employee_name}｜{attend_date.isoformat()}｜{status}", "成功")
@@ -3774,6 +3806,7 @@ def create_attendance_record(employee_name: str, attend_date: date, status: str,
         st.error(f"寫入出勤失敗：{e}")
         log_action(actor or "—", "出勤新增", f"寫入失敗：{e}", "系統錯誤")
         return False
+
 
 @st.cache_data(ttl=60)
 # ============================================================
@@ -3787,7 +3820,10 @@ def _attend_day_range(attend_date: date) -> tuple[str, str]:
 
 
 def find_attendance_page(employee_name: str, attend_date: date) -> str | None:
-    """用『員工姓名(Title)+出勤日期(Date)』找出當日是否已存在出勤紀錄，回傳 page_id 或 None。"""
+    """找出【同一員工 + 同一天】是否已存在出勤紀錄，回傳 page_id 或 None。
+
+    ✅ 改成 Query 邏輯：員工姓名欄位可能是 title 或 rich_text，不再硬寫 title filter。
+    """
     if not ATTEND_DB_ID:
         return None
 
@@ -3796,28 +3832,61 @@ def find_attendance_page(employee_name: str, attend_date: date) -> str | None:
         return None
 
     try:
+        props_meta = get_db_properties(ATTEND_DB_ID)
         start_iso, end_iso = _attend_day_range(attend_date)
-        res = notion.databases.query(
+
+        name_filter = None
+        if "員工姓名" in (props_meta or {}):
+            name_filter = _equals_filter_by_type(props_meta, "員工姓名", employee_name)
+
+        base_filters = [
+            {"property": "出勤日期", "date": {"on_or_after": start_iso}},
+            {"property": "出勤日期", "date": {"before": end_iso}},
+        ]
+
+        # 能用 filter 就用 filter（省流量）
+        if name_filter:
+            res = db_query(
+                database_id=ATTEND_DB_ID,
+                page_size=5,
+                filter={"and": [name_filter, *base_filters]},
+            )
+            results = (res or {}).get("results") or []
+            if results:
+                return results[0].get("id")
+            return None
+
+        # 否則：只用日期範圍查出當天全部，再用程式比對姓名（最穩）
+        res = db_query(
             database_id=ATTEND_DB_ID,
-            page_size=1,
-            filter={
-                "and": [
-                    {"property": "員工姓名", "title": {"equals": employee_name}},
-                    {"property": "出勤日期", "date": {"on_or_after": start_iso}},
-                    {"property": "出勤日期", "date": {"before": end_iso}},
-                ]
-            },
+            page_size=100,
+            filter={"and": base_filters},
         )
         results = (res or {}).get("results") or []
-        if results:
-            return results[0].get("id")
+
+        for p in results:
+            props = (p.get("properties") or {})
+            name_prop = props.get("員工姓名", {}) or {}
+            ptype = name_prop.get("type")
+            if ptype == "title":
+                nm = (_title_get_first_plain_text(name_prop) or "").strip()
+            elif ptype == "rich_text":
+                nm = (_get_prop_plain_text(name_prop) or "").strip()
+            else:
+                nm = ((_title_get_first_plain_text(name_prop) or _get_prop_plain_text(name_prop) or "").strip())
+            if nm == employee_name:
+                return p.get("id")
+
         return None
     except Exception:
         return None
 
 
 def upsert_attendance_record(employee_name: str, attend_date: date, status: str, actor: str = "") -> bool:
-    """同日同人：有就更新、沒有就新增。"""
+    """同日同人：有就更新、沒有就新增（出勤記錄表）。
+
+    ✅ 改成 Query 邏輯：員工姓名欄位可能是 title 或 rich_text，不再硬寫 title。
+    """
     if not ATTEND_DB_ID:
         st.error("❌ 尚未設定 ATTEND_DB_ID（出勤記錄表 Database ID）")
         return False
@@ -3829,26 +3898,49 @@ def upsert_attendance_record(employee_name: str, attend_date: date, status: str,
         return False
 
     try:
-        props_meta = get_db_properties(ATTEND_DB_ID)
+        props_meta = get_db_properties(ATTEND_DB_ID, force_refresh=True)
 
-        def has_prop(n: str) -> bool:
-            return n in (props_meta or {})
-
-        # 驗證狀態選項
-        options = get_select_options(ATTEND_DB_ID, "出勤狀態") or [ATTEND_PRESENT_STATUS, ATTEND_LEAVE_STATUS, ATTEND_LATE_STATUS]
-        if status not in options:
-            st.error(f"❌ 出勤狀態 Notion 選項不存在：{status}（請先在 Notion 建立選項）")
-            return False
+        # 驗證狀態選項（select/status）
+        if "出勤狀態" in (props_meta or {}):
+            meta = (props_meta or {}).get("出勤狀態", {}) or {}
+            t = meta.get("type")
+            options = []
+            if t == "select":
+                options = get_select_options(ATTEND_DB_ID, "出勤狀態") or []
+            elif t == "status":
+                options = [o.get("name") for o in (meta.get("status", {}).get("options", []) or []) if o.get("name")]
+            if options and (status not in options):
+                st.error(f"❌ 出勤狀態 Notion 選項不存在：{status}（請先在 Notion 建立選項）")
+                return False
 
         page_id = find_attendance_page(employee_name, attend_date)
 
-        props = {}
-        if has_prop("員工姓名") and (not page_id):
-            props["員工姓名"] = {"title": [{"text": {"content": employee_name}}]}
-        if has_prop("出勤日期"):
-            props["出勤日期"] = {"date": {"start": datetime.combine(attend_date, datetime.min.time()).isoformat()}}
-        if has_prop("出勤狀態"):
-            props["出勤狀態"] = {"select": {"name": status}}
+        props: dict = {}
+
+        # 若為新增，才需要寫入員工姓名（更新不一定要動它）
+        if not page_id:
+            if "員工姓名" in (props_meta or {}):
+                _best_set_text(props, props_meta, "員工姓名", employee_name)
+            else:
+                tname = _first_title_prop_name(props_meta)
+                if tname:
+                    _best_set_text(props, props_meta, tname, employee_name)
+
+        if "出勤日期" in (props_meta or {}):
+            props["出勤日期"] = {
+                "date": {"start": datetime.combine(attend_date, datetime.min.time()).isoformat()}
+            }
+
+        if "出勤狀態" in (props_meta or {}):
+            meta = (props_meta or {}).get("出勤狀態", {}) or {}
+            t = meta.get("type")
+            if t == "status":
+                props["出勤狀態"] = {"status": {"name": status}}
+            else:
+                props["出勤狀態"] = {"select": {"name": status}}
+
+        if not props:
+            raise RuntimeError("Notion properties 組裝結果為空（請確認出勤記錄表欄位名稱/Integration 權限）")
 
         if page_id:
             notion.pages.update(page_id=page_id, properties=props)
@@ -3863,6 +3955,7 @@ def upsert_attendance_record(employee_name: str, attend_date: date, status: str,
         st.error(f"寫入出勤失敗：{e}")
         log_action(actor or "—", "出勤寫入", f"寫入失敗：{e}", "系統錯誤")
         return False
+
 
 
 def get_attendance_status_map_by_date(attend_date: date) -> dict[str, str]:
@@ -3941,8 +4034,14 @@ def list_attendance_records(start_d: date, end_d: date, employee_name: str | Non
             {"property": "出勤日期", "date": {"on_or_after": datetime.combine(start_d, datetime.min.time()).isoformat()}},
             {"property": "出勤日期", "date": {"before": datetime.combine(end_d, datetime.min.time()).isoformat()}},
         ]
+        # ✅ 員工姓名欄位可能是 title 或 rich_text：用 schema 自動選 filter；不支援時就改成查完再程式過濾
+        emp_filter = None
         if emp and emp != "全部員工":
-            filters.insert(0, {"property": "員工姓名", "title": {"equals": emp}})
+            props_meta = get_db_properties(ATTEND_DB_ID)
+            if "員工姓名" in (props_meta or {}):
+                emp_filter = _equals_filter_by_type(props_meta, "員工姓名", emp)
+            if emp_filter:
+                filters.insert(0, emp_filter)
 
         query = {
             "database_id": ATTEND_DB_ID,
@@ -3963,9 +4062,15 @@ def list_attendance_records(start_d: date, end_d: date, employee_name: str | Non
             for page in res.get("results", []):
                 props = page["properties"]
 
-                def get_title(name):
-                    v = props.get(name, {}).get("title", [])
-                    return v[0]["plain_text"] if v else ""
+                def get_text(name: str) -> str:
+                    p = props.get(name, {}) or {}
+                    t = p.get("type")
+                    if t == "title":
+                        return (_title_get_first_plain_text(p) or "")
+                    if t == "rich_text":
+                        return (_get_prop_plain_text(p) or "")
+                    # fallback
+                    return (_title_get_first_plain_text(p) or _get_prop_plain_text(p) or "")
 
                 def get_select(name):
                     p = props.get(name, {}) or {}
@@ -3992,9 +4097,13 @@ def list_attendance_records(start_d: date, end_d: date, employee_name: str | Non
                     except Exception:
                         return d.get("start", "")
 
+                emp_name_row = get_text("員工姓名").strip()
+                if emp and emp != "全部員工" and (not emp_filter) and emp_name_row != emp:
+                    continue
+
                 rows.append({
                     "_page_id": page["id"],
-                    "員工姓名": get_title("員工姓名"),
+                    "員工姓名": emp_name_row,
                     "出勤日期": get_date_only("出勤日期"),
                     "出勤狀態": get_select("出勤狀態"),
                     "建立時間": props.get("建立時間", {}).get("created_time", ""),
