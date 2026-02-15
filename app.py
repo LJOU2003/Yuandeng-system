@@ -3743,8 +3743,13 @@ def make_excel_bytes(rows: list[dict], filename_hint: str = "salary.xlsx") -> tu
 # ✅ 出勤記錄表
 # ============================================================
 def create_attendance_record(employee_name: str, attend_date: date, status: str, actor: str = "") -> bool:
-    """新增一筆【出勤記錄表】。
-    ✅ 改為「Query 邏輯」同款的 schema 容錯：不再硬寫 title，而是依資料庫欄位型態（title / rich_text）自動組 payload。
+    """新增/更新一筆【出勤記錄表】（Query 邏輯）。
+
+    ✅ 行為：
+    - 先用 databases.query 找「同員工 + 同日期」是否已存在
+      - 有：pages.update 更新出勤狀態
+      - 無：pages.create 新增
+    - **若解析不到必要欄位，就直接報錯並停止**（避免建立空白列）
     """
     if not ATTEND_DB_ID:
         st.error("❌ 尚未設定 ATTEND_DB_ID（出勤記錄表 Database ID）")
@@ -3757,68 +3762,82 @@ def create_attendance_record(employee_name: str, attend_date: date, status: str,
         return False
 
     try:
-        # ✅ 強制重抓 schema：避免曾快取到空 properties
-        props_meta = get_db_properties(ATTEND_DB_ID, force_refresh=True)
+        props_meta = get_db_properties(ATTEND_DB_ID) or {}
 
-        props: dict = {}
+        # 1) 解析欄位 key（容錯）
+        title_key = resolve_title_prop(ATTEND_DB_ID)
+        name_key = resolve_prop_key(props_meta, "員工姓名") or title_key
+        date_key = resolve_prop_key(props_meta, "出勤日期")
+        status_key = resolve_prop_key(props_meta, "出勤狀態")
 
-        # 1) 員工姓名：依欄位型態自動寫入（title / rich_text）
-        if "員工姓名" in (props_meta or {}):
-            _best_set_text(props, props_meta, "員工姓名", employee_name)
+        missing = []
+        if not title_key:
+            missing.append("Title(type=title)")
+        if not name_key:
+            missing.append("員工姓名")
+        if not date_key:
+            missing.append("出勤日期")
+        if not status_key:
+            missing.append("出勤狀態")
+        if missing:
+            raise RuntimeError(f"出勤記錄表缺少必要欄位：{', '.join(missing)}（請確認 DB 欄位/Integration 共享）")
+
+        # 2) Query：同員工 + 同日期
+        filters = {"and": []}
+
+        # 名稱：依欄位型態建立 equals filter（title/rich_text）
+        f_name = _equals_filter_by_type(props_meta, name_key, employee_name)
+        if f_name:
+            filters["and"].append(f_name)
+
+        # 日期：date equals
+        filters["and"].append({"property": date_key, "date": {"equals": attend_date.isoformat()}})
+
+        res = notion.databases.query(database_id=ATTEND_DB_ID, page_size=5, filter=filters)
+        results = (res or {}).get("results", []) or []
+
+        # 3) 組 properties payload（給 create / update）
+        upd_props: dict = {}
+
+        # 出勤狀態（select / status）
+        st_meta = (props_meta or {}).get(status_key, {}) or {}
+        if st_meta.get("type") == "status":
+            upd_props[status_key] = {"status": {"name": status}}
         else:
-            # fallback：找 DB 裡的 title 欄位名稱（理論上一定有）
-            tname = _first_title_prop_name(props_meta)
-            if tname:
-                _best_set_text(props, props_meta, tname, employee_name)
+            upd_props[status_key] = {"select": {"name": status}}
 
-        # 2) 出勤日期
-        if "出勤日期" in (props_meta or {}):
-            props["出勤日期"] = {
-                "date": {"start": datetime.combine(attend_date, datetime.min.time()).isoformat()}
-            }
+        if results:
+            page_id = results[0].get("id")
+            notion.pages.update(page_id=page_id, properties=upd_props)
+        else:
+            create_props: dict = {}
 
-        # 3) 出勤狀態（select / status）
-        if "出勤狀態" in (props_meta or {}):
-            meta = (props_meta or {}).get("出勤狀態", {}) or {}
-            t = meta.get("type")
-            if t in ("select", "status"):
-                # 先做選項驗證（有 options 就驗證，拿不到就直接寫入交給 Notion 驗）
-                options = []
-                try:
-                    if t == "select":
-                        options = get_select_options(ATTEND_DB_ID, "出勤狀態") or []
-                    elif t == "status":
-                        options = [o.get("name") for o in (meta.get("status", {}).get("options", []) or []) if o.get("name")]
-                except Exception:
-                    options = []
+            # Title 必填：用員工姓名當 title
+            create_props[title_key] = {"title": [{"text": {"content": employee_name}}]}
 
-                if options and (status not in options):
-                    st.error(f"❌ 出勤狀態 Notion 選項不存在：{status}（請先在 Notion 建立選項）")
-                    return False
+            # 員工姓名（若不是同一欄位，補寫）
+            if name_key != title_key:
+                _best_set_text(create_props, props_meta, name_key, employee_name)
 
-                if t == "status":
-                    props["出勤狀態"] = {"status": {"name": status}}
-                else:
-                    props["出勤狀態"] = {"select": {"name": status}}
+            # 出勤日期
+            create_props[date_key] = {"date": {"start": attend_date.isoformat()}}
 
-        # ✅ 真的要寫入的 properties 不可為空
-        if not props:
-            raise RuntimeError("Notion properties 組裝結果為空（請確認出勤記錄表欄位名稱/Integration 權限）")
+            # 出勤狀態
+            create_props.update(upd_props)
 
-        notion.pages.create(parent={"database_id": ATTEND_DB_ID}, properties=props)
+            if not create_props:
+                raise RuntimeError("出勤記錄表 properties 產生失敗（空 dict），已阻止建立空白列")
+
+            notion.pages.create(parent={"database_id": ATTEND_DB_ID}, properties=create_props)
+
         log_action(actor or "—", "出勤新增", f"{employee_name}｜{attend_date.isoformat()}｜{status}", "成功")
         return True
 
     except Exception as e:
         st.error(f"寫入出勤失敗：{e}")
-        log_action(actor or "—", "出勤新增", f"寫入失敗：{e}", "系統錯誤")
+        log_action(actor or "—", "出勤新增", f"寫入出勤失敗：{e}", "系統錯誤")
         return False
 
-
-@st.cache_data(ttl=60)
-# ============================================================
-# ✅ 出勤記錄表（查詢 / 更新）
-# ============================================================
 def _attend_day_range(attend_date: date) -> tuple[str, str]:
     """回傳 Notion date filter 用的 [start_iso, end_iso) 區間（以該日 00:00:00 起算）。"""
     start_dt = datetime.combine(attend_date, datetime.min.time())
@@ -4256,12 +4275,13 @@ def calc_working_days_for_lunch(employee_name: str, y: int, m: int) -> tuple[int
     return len(working_list), working_list
 
 
-def create_lunch_record(employee_name: str, lunch_date: date, amount: float, actor: str = "") -> bool:
-    """
-    午餐訂餐表欄位（依你截圖）：
-      - 員工姓名 (title)
-      - 訂餐金額 (number)
-      - 訂餐日期 (date)
+def create_lunch_record(employee_name: str, amount: float, order_date: date, actor: str = "") -> bool:
+    """新增一筆【午餐訂餐表】。
+
+    ✅ 重點修正：
+    - **永遠不在 properties 為空時建立 page**（避免出現「建立時間有、其他欄位全空白」的假成功列）
+    - 以「Query/Schema 容錯」方式解析欄位 key（支援欄位名稱些微差異）
+    - Title 欄位不再硬抓「員工姓名」：自動取資料庫的 title 欄位（Notion 必填）
     """
     if not LUNCH_DB_ID:
         st.error("❌ 尚未設定 LUNCH_DB_ID（午餐訂餐表 Database ID）")
@@ -4273,26 +4293,53 @@ def create_lunch_record(employee_name: str, lunch_date: date, amount: float, act
         return False
 
     try:
-        props_meta = get_db_properties(LUNCH_DB_ID)
+        props_meta = get_db_properties(LUNCH_DB_ID) or {}
 
-        def has_prop(n: str) -> bool:
-            return n in (props_meta or {})
+        # 1) 解析欄位 key（容錯比對）
+        title_key = resolve_title_prop(LUNCH_DB_ID)  # 真正 type=title 的欄位名
+        name_key = resolve_prop_key(props_meta, "員工姓名") or title_key
+        amt_key = resolve_prop_key(props_meta, "訂餐金額")
+        date_key = resolve_prop_key(props_meta, "訂餐日期")
 
-        props = {}
-        if has_prop("員工姓名"):
-            props["員工姓名"] = {"title": [{"text": {"content": employee_name}}]}
-        if has_prop("訂餐金額"):
-            props["訂餐金額"] = {"number": float(amount or 0)}
-        if has_prop("訂餐日期"):
-            props["訂餐日期"] = {"date": {"start": datetime.combine(lunch_date, datetime.min.time()).isoformat()}}
+        # 2) 必要欄位檢查（少任何一個就不要建立 page，避免空白列）
+        missing = []
+        if not title_key:
+            missing.append("Title(type=title)")
+        if not name_key:
+            missing.append("員工姓名")
+        if not amt_key:
+            missing.append("訂餐金額")
+        if not date_key:
+            missing.append("訂餐日期")
+        if missing:
+            raise RuntimeError(f"午餐訂餐表缺少必要欄位：{', '.join(missing)}（請確認 DB 欄位/Integration 共享）")
+
+        props: dict = {}
+
+        # 3) Title（Notion 必填）→ 用員工姓名當 title（穩定又好查）
+        props[title_key] = {"title": [{"text": {"content": employee_name}}]}
+
+        # 4) 員工姓名（如果不是同一個 title 欄位，就再寫一份到該欄位）
+        if name_key != title_key:
+            _best_set_text(props, props_meta, name_key, employee_name)
+
+        # 5) 訂餐金額
+        props[amt_key] = {"number": float(amount)}
+
+        # 6) 訂餐日期
+        props[date_key] = {"date": {"start": datetime.combine(order_date, datetime.min.time()).isoformat()}}
+
+        # ✅ 最後保險：避免空 props 造成空白列
+        if not props:
+            raise RuntimeError("午餐訂餐表 properties 產生失敗（空 dict），已阻止建立空白列")
 
         notion.pages.create(parent={"database_id": LUNCH_DB_ID}, properties=props)
-        log_action(actor or employee_name, "午餐訂餐", f"{employee_name}｜{lunch_date.isoformat()}｜${float(amount or 0):.0f}", "成功")
+        log_action(actor or "—", "午餐訂餐", f"{employee_name}｜{order_date.isoformat()}｜${amount}", "成功")
         return True
 
     except Exception as e:
-        st.error(f"寫入午餐訂餐失敗：{e}")
-        log_action(actor or employee_name, "午餐訂餐", f"寫入失敗：{e}", "系統錯誤")
+        st.error(f"新增午餐訂餐失敗：{e}")
+        log_action(actor or "—", "午餐訂餐", f"新增午餐訂餐失敗：{e}", "系統錯誤")
         return False
 
 
