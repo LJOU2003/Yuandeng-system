@@ -6460,3 +6460,198 @@ else:
 # ✅ Global footer
 # =========================
 render_footer()
+
+
+
+# ============================================================
+# ✅ LJOU Hotfix Patch (stability override)
+#  - Fix NameError: _normalize_notion_id / _normalize_notion_id mismatch
+#  - Fix get_db_properties(force_refresh=...) unexpected keyword
+#  - Make "公告新增" / "午餐新增" use DB meta to map correct欄位，避免寫入空白
+#  - Ensure 操作記錄表僅在 Notion API 成功後才寫「成功」
+# ============================================================
+
+def _normalize_notion_id(raw: str | None) -> str | None:
+    """Accepts DB/Page id or Notion URL; returns 32-hex id without dashes."""
+    if not raw:
+        return None
+    s = str(raw).strip()
+    s = s.split("?")[0].rstrip("/")
+    s = s.split("/")[-1]
+    s = s.replace("-", "")
+    s2 = re.sub(r"[^0-9a-fA-F]", "", s)
+    if len(s2) == 32:
+        return s2.lower()
+    if len(s2) > 32:
+        return s2[-32:].lower()
+    return s2.lower() if s2 else None
+
+# backward-compat aliases
+_normalize_notion_id = _normalize_notion_id  # type: ignore
+
+
+def _norm_prop_name(s: str) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    trans = str.maketrans({"（": "(", "）": ")", "　": " ", "\u00A0": " "})
+    s = s.translate(trans)
+    s = s.replace(" ", "")
+    return s.strip().lower()
+
+
+def get_db_properties(database_id: str, force_refresh: bool = False):
+    """Unified DB properties getter (final override)."""
+    if not database_id:
+        return {}
+    dbid = _normalize_notion_id(database_id) or database_id
+    cache = st.session_state.setdefault("_db_props_cache", {})
+    if force_refresh:
+        cache.pop(dbid, None)
+    if dbid in cache:
+        return cache[dbid]
+    try:
+        res = notion.databases.retrieve(database_id=dbid)
+        props = (res or {}).get("properties", {}) or {}
+        cache[dbid] = props
+        return props
+    except Exception:
+        return {}
+
+
+def resolve_title_prop_name(database_id: str) -> str | None:
+    props = get_db_properties(database_id, force_refresh=False) or {}
+    for k, meta in props.items():
+        if (meta or {}).get("type") == "title":
+            return k
+    return None
+
+
+def _find_prop_by_name_and_type(props_meta: dict, want_names: list[str], want_type: str | None = None) -> str | None:
+    wants_norm = {_norm_prop_name(n) for n in (want_names or []) if n}
+    for k, meta in (props_meta or {}).items():
+        if _norm_prop_name(k) in wants_norm:
+            if want_type is None or (meta or {}).get("type") == want_type:
+                return k
+    return None
+
+
+def _find_first_by_type(props_meta: dict, want_type: str) -> str | None:
+    for k, meta in (props_meta or {}).items():
+        if (meta or {}).get("type") == want_type:
+            return k
+    return None
+
+
+def _safe_date_start(d: date) -> str:
+    return datetime.combine(d, datetime.min.time()).isoformat()
+
+
+def _make_title_from_content(content: str, n: int = 3) -> str:
+    c = (content or "").strip().replace("\r", " ").replace("\n", " ")
+    head = c[:n].strip()
+    return head or "—"
+
+
+def create_announcement(publish_date: date, content: str, end_date: date | None, actor: str = "") -> bool:
+    if not ANNOUNCE_DB_ID:
+        st.error("❌ 尚未設定 ANNOUNCE_DB_ID（公告紀錄表 Database ID）")
+        return False
+
+    content = (content or "").strip()
+    if not content:
+        st.error("❌ 公告內容不可為空")
+        return False
+
+    dbid = _normalize_notion_id(ANNOUNCE_DB_ID) or ANNOUNCE_DB_ID
+    props_meta = get_db_properties(dbid, force_refresh=True) or {}
+
+    title_key = resolve_title_prop_name(dbid) or _find_first_by_type(props_meta, "title")
+    if not title_key:
+        st.error("❌ 找不到公告表的 Title 欄位（type=title）。請確認 Integration 已共享此資料庫。")
+        return False
+
+    done_key = _find_prop_by_name_and_type(props_meta, ["完成情況", "完成狀態"], "checkbox")
+    pub_key = _find_prop_by_name_and_type(props_meta, ["發布日期", "發佈日期", "發布時間"], "date")
+    end_key = _find_prop_by_name_and_type(props_meta, ["結束時間", "結束日期"], "date")
+
+    content_key = (
+        _find_prop_by_name_and_type(props_meta, ["公告內容", "內容"], "rich_text")
+        or _find_prop_by_name_and_type(props_meta, ["公告內容", "內容"], "title")
+        or _find_first_by_type(props_meta, "rich_text")
+    )
+
+    props: dict = {}
+    props[title_key] = {"title": [{"text": {"content": _make_title_from_content(content, 3)}}]}
+
+    if done_key:
+        props[done_key] = {"checkbox": False}
+    if pub_key:
+        props[pub_key] = {"date": {"start": _safe_date_start(publish_date)}}
+    if end_date and end_key:
+        props[end_key] = {"date": {"start": _safe_date_start(end_date)}}
+
+    if content_key:
+        ctype = (props_meta.get(content_key) or {}).get("type")
+        if ctype == "title":
+            props[content_key] = {"title": [{"text": {"content": content}}]}
+        else:
+            props[content_key] = {"rich_text": [{"text": {"content": content}}]}
+
+    try:
+        notion.pages.create(parent={"database_id": dbid}, properties=props)
+        log_action(actor or "—", "公告管理", f"新增公告：{publish_date.isoformat()}｜{content[:30]}", "成功")
+        return True
+    except Exception as e:
+        st.error(f"新增公告失敗：{e}")
+        log_action(actor or "—", "公告管理", f"新增公告失敗：{e}", "系統錯誤")
+        return False
+
+
+def create_lunch_order(employee_name: str, lunch_date: date, amount: float, actor: str = "") -> bool:
+    if not LUNCH_DB_ID:
+        st.error("❌ 尚未設定 LUNCH_DB_ID（午餐訂餐表 Database ID）")
+        return False
+
+    employee_name = (employee_name or "").strip()
+    if not employee_name:
+        st.error("❌ 員工姓名不可為空")
+        return False
+
+    dbid = _normalize_notion_id(LUNCH_DB_ID) or LUNCH_DB_ID
+    props_meta = get_db_properties(dbid, force_refresh=True) or {}
+
+    title_key = resolve_title_prop_name(dbid) or _find_first_by_type(props_meta, "title")
+    if not title_key:
+        st.error("❌ 找不到午餐表的 Title 欄位（type=title）。請確認 Integration 已共享此資料庫。")
+        return False
+
+    amt_key = (
+        _find_prop_by_name_and_type(props_meta, ["訂餐金額", "金額", "餐費"], "number")
+        or _find_first_by_type(props_meta, "number")
+    )
+    date_key = (
+        _find_prop_by_name_and_type(props_meta, ["訂餐日期", "日期", "訂餐時間"], "date")
+        or _find_first_by_type(props_meta, "date")
+    )
+
+    props: dict = {title_key: {"title": [{"text": {"content": employee_name}}]}}
+    if amt_key:
+        props[amt_key] = {"number": float(amount or 0)}
+    if date_key:
+        props[date_key] = {"date": {"start": _safe_date_start(lunch_date)}}
+
+    try:
+        notion.pages.create(parent={"database_id": dbid}, properties=props)
+        log_action(actor or employee_name, "午餐訂餐", f"{employee_name}｜{lunch_date.isoformat()}｜${float(amount or 0):.0f}", "成功")
+        return True
+    except Exception as e:
+        st.error(f"寫入午餐訂餐失敗：{e}")
+        log_action(actor or employee_name, "午餐訂餐", f"寫入失敗：{e}", "系統錯誤")
+        return False
+
+
+# --- Compatibility aliases ---
+globals().setdefault("add_lunch_record", create_lunch_order)
+globals().setdefault("create_lunch_record", create_lunch_order)
+
