@@ -439,20 +439,27 @@ def get_account_page_by_username(username: str) -> dict | None:
         return None
 
 @st.cache_data(ttl=60)
-def get_db_properties(database_id: str) -> dict:
+def _get_db_properties_cached(database_id: str) -> dict:
+    """Fetch Notion DB properties (cached 60s)."""
     try:
         db = notion.databases.retrieve(database_id=database_id)
         return db.get("properties", {}) or {}
-    except Exception as e:
-        # ✅ 佈署到 Streamlit Cloud 時，如果 secrets/token/權限或 DB_ID 有問題，這裡會失敗
-        #    開啟 DEBUG_NOTION=1 才顯示錯誤，避免一般使用者看到內部訊息
-        if os.getenv("DEBUG_NOTION", "").strip() == "1":
-            st.error(f"❌ Notion 讀取資料庫欄位失敗（{database_id}）：{e}")
+    except Exception:
         return {}
 
+def get_db_properties(database_id: str, force_refresh: bool = False) -> dict:
+    """Get Notion DB properties with optional force refresh.
 
+    force_refresh=True will bypass Streamlit cache to avoid using a previously cached empty dict.
+    """
+    if force_refresh:
+        try:
+            db = notion.databases.retrieve(database_id=database_id)
+            return db.get("properties", {}) or {}
+        except Exception:
+            return {}
+    return _get_db_properties_cached(database_id)
 
-@st.cache_data(ttl=60)
 def get_select_options(database_id: str, property_name: str) -> list[str]:
     try:
         props = get_db_properties(database_id)
