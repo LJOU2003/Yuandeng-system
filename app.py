@@ -438,17 +438,32 @@ def get_account_page_by_username(username: str) -> dict | None:
     except Exception:
         return None
 
-@st.cache_data(ttl=60)
-def get_db_properties(database_id: str, force_refresh: bool = False, **_kwargs) -> dict:
-    """讀取 Notion DB schema（properties）。
 
-    - 支援 32 碼 / 帶 dash / 整段網址 的 database_id（會先 normalize）
-    - force_refresh 只是用來讓 cache key 變化，必要時繞過快取重新抓 schema
+
+def _normalize_notion_id(raw: str | None) -> str | None:
+    """把 Notion 的 DB/Page ID（可能是 32 碼、帶 dash 的 UUID、或整段網址）
+    統一成 Notion API 可吃的 UUID（8-4-4-4-12）。
     """
+    if not raw:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    # 先抓帶 dash 的 UUID
+    m = re.search(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", s)
+    if m:
+        return m.group(0).lower()
+    # 再抓 32 hex
+    m = re.search(r"([0-9a-fA-F]{32})", s)
+    if not m:
+        return None
+    h = m.group(1).lower()
+    return f"{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
+
+@st.cache_data(ttl=60)
+def get_db_properties(database_id: str) -> dict:
     try:
-        _ = bool(force_refresh)  # 讓 cache key 會因 force_refresh 改變
-        dbid = _normalize_notion_id(database_id) or database_id
-        db = notion.databases.retrieve(database_id=dbid)
+        db = notion.databases.retrieve(database_id=database_id)
         return db.get("properties", {}) or {}
     except Exception as e:
         # ✅ 佈署到 Streamlit Cloud 時，如果 secrets/token/權限或 DB_ID 有問題，這裡會失敗
@@ -456,6 +471,8 @@ def get_db_properties(database_id: str, force_refresh: bool = False, **_kwargs) 
         if os.getenv("DEBUG_NOTION", "").strip() == "1":
             st.error(f"❌ Notion 讀取資料庫欄位失敗（{database_id}）：{e}")
         return {}
+
+
 
 @st.cache_data(ttl=60)
 def get_select_options(database_id: str, property_name: str) -> list[str]:
@@ -969,10 +986,9 @@ def _now_iso() -> str:
 
 
 def _make_announce_title(content: str, pub_date: date) -> str:
-    # ✅ Notion 的 title 必填：你現在不想用標題欄，因此用「內容前 3 個字」當作 title
-    c = (content or "").strip().replace("\n", " ").replace("\r", " ")
-    head = c[:3].strip()
-    return head or "公告"
+    c = (content or "").strip().replace("\n", " ")
+    c = c[:20] + ("…" if len(c) > 20 else "")
+    return f"{pub_date.isoformat()}｜{c or '公告'}"
 
 
 def create_announcement(publish_date: date, content: str, end_date: date | None, actor: str = "") -> bool:
@@ -986,10 +1002,10 @@ def create_announcement(publish_date: date, content: str, end_date: date | None,
         return False
 
     try:
-        dbid = _normalize_notion_id(ANNOUNCE_DB_ID) or ANNOUNCE_DB_ID
-        props_meta = get_db_properties(dbid, force_refresh=True) or {}
+        props_meta = get_db_properties(ANNOUNCE_DB_ID, force_refresh=True) or {}
+        title_prop = resolve_title_prop_name(ANNOUNCE_DB_ID)  # 自動找 type=title 的欄位
 
-        # 容錯：欄位名可能被你改成「內容」、或有空白/全形括號差異
+        # 容錯：欄位名可能有全形括號/全形空白/多空白
         def _norm(s: str) -> str:
             if s is None:
                 return ""
@@ -1006,19 +1022,25 @@ def create_announcement(publish_date: date, content: str, end_date: date | None,
                     return k
             return None
 
-        title_prop = resolve_title_prop_name(dbid)  # 自動找 type=title 的欄位名
-        done_prop = _find_prop("完成情況", "checkbox")
-        pub_prop = _find_prop("發布日期", "date")
-        end_prop = _find_prop("結束時間", "date")
+        def _find_any(wants: list[str], want_type: str | None = None) -> str | None:
+            for w in wants:
+                hit = _find_prop(w, want_type)
+                if hit:
+                    return hit
+            return None
 
-        # 公告內容欄位：優先找「公告內容」(rich_text)，找不到就改找「內容」(rich_text)
-        content_prop = _find_prop("公告內容", "rich_text") or _find_prop("內容", "rich_text")
+        done_prop = _find_any(["完成情況", "完成狀態"], "checkbox")
+        pub_prop = _find_any(["發布日期", "發佈日期", "發布時間"], "date")
+        end_prop = _find_any(["結束時間", "結束日期"], "date")
+        # 公告內容欄位：優先找「公告內容」，其次找「內容」（如果你把 rich_text 欄位改名）
+        content_prop = _find_any(["公告內容", "內容"], None)
 
-        props: dict = {}
+        props = {}
 
-        # ✅ Title（Notion 必填）— 用內容前 3 字
-        if title_prop:
-            props[title_prop] = {"title": [{"text": {"content": _make_announce_title(content, publish_date)}}]}
+        # ✅ Title（Notion 必填）—你不想用標題欄，所以用「內容前 3 字」當 title
+        if title_prop is not None:
+            head = (content or "").strip().replace("\n", " ").replace("\r", " ")[:3].strip()
+            props[title_prop] = {"title": [{"text": {"content": head or "公告"}}]}
 
         # ✅ 完成情況（預設 False）
         if done_prop:
@@ -1028,23 +1050,31 @@ def create_announcement(publish_date: date, content: str, end_date: date | None,
         if pub_prop:
             props[pub_prop] = {"date": {"start": datetime.combine(publish_date, datetime.min.time()).isoformat()}}
 
-        # ✅ 公告內容（rich_text）
+        # ✅ 公告內容（rich_text / title 皆可）
         if content_prop:
-            props[content_prop] = {"rich_text": [{"text": {"content": content}}]}
+            ptype = (props_meta.get(content_prop) or {}).get("type")
+            if ptype == "rich_text":
+                props[content_prop] = {"rich_text": [{"text": {"content": content}}]}
+            elif ptype == "title":
+                # 如果你把「公告內容」做成 title，也能寫
+                props[content_prop] = {"title": [{"text": {"content": content}}]}
+            else:
+                # 其他型態不寫，避免 Notion 400
+                pass
 
         # ✅ 結束時間（可空）
         if end_date and end_prop:
             props[end_prop] = {"date": {"start": datetime.combine(end_date, datetime.min.time()).isoformat()}}
 
-        notion.pages.create(parent={"database_id": dbid}, properties=props)
-
-        log_action(actor or "—", "公告管理", f"新增公告：{publish_date.isoformat()} | {content[:30]}", "成功")
+        notion.pages.create(parent={"database_id": ANNOUNCE_DB_ID}, properties=props)
+        log_action(actor or "—", "公告管理", f"新增公告：{publish_date.isoformat()}｜{content[:30]}", "成功")
         return True
 
     except Exception as e:
         st.error(f"新增公告失敗：{e}")
-        log_action(actor or "—", "公告管理", f"新增公告：{publish_date.isoformat()} | {content[:30]}", f"失敗：{e}")
+        log_action(actor or "—", "公告管理", f"新增公告失敗：{e}", "系統錯誤")
         return False
+
 
 def mark_announcement_done(page_id: str, done: bool, actor: str = "") -> bool:
     if not ANNOUNCE_DB_ID:
@@ -2035,7 +2065,7 @@ def upsert_overtime_rule_to_notion(
     if not OVERTIME_RULE_DB_ID:
         raise RuntimeError("尚未設定 OVERTIME_RULE_DB_ID（加班設定表 DB ID）")
 
-    dbid = _normalize_notion_id(OVERTIME_RULE_DB_ID)
+    dbid = _normalize_notion_id(OVERTIME_RULE_DB_ID) or OVERTIME_RULE_DB_ID
     if not dbid:
         raise RuntimeError("OVERTIME_RULE_DB_ID 格式不正確（無法解析 Notion DB ID）")
 
