@@ -438,10 +438,32 @@ def get_account_page_by_username(username: str) -> dict | None:
     except Exception:
         return None
 
+
+def _normalize_notion_id(raw: str | None) -> str | None:
+    """把 Notion 的 DB/Page ID（可能是 32 碼、帶 dash 的 UUID、或整段網址）統一成 Notion 可吃的 UUID 格式。"""
+    if not raw:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+
+    m = re.search(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", s)
+    if m:
+        return m.group(0).lower()
+
+    m = re.search(r"([0-9a-fA-F]{32})", s)
+    if not m:
+        return None
+
+    h = m.group(1).lower()
+    return f"{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
+
+
 @st.cache_data(ttl=60)
 def get_db_properties(database_id: str) -> dict:
     try:
-        db = notion.databases.retrieve(database_id=database_id)
+        dbid = _normalize_notion_id(database_id) or database_id
+        db = notion.databases.retrieve(database_id=dbid)
         return db.get("properties", {}) or {}
     except Exception as e:
         # ✅ 佈署到 Streamlit Cloud 時，如果 secrets/token/權限或 DB_ID 有問題，這裡會失敗
@@ -1016,7 +1038,7 @@ def create_announcement(publish_date: date, content: str, end_date: date | None,
         if end_date and has_prop("結束時間"):
             props["結束時間"] = {"date": {"start": datetime.combine(end_date, datetime.min.time()).isoformat()}}
 
-        notion.pages.create(parent={"database_id": ANNOUNCE_DB_ID}, properties=props)
+        notion.pages.create(parent={"database_id": (_normalize_notion_id(ANNOUNCE_DB_ID) or ANNOUNCE_DB_ID)}, properties=props)
         log_action(actor or "—", "公告管理", f"新增公告：{publish_date.isoformat()}｜{content[:30]}", "成功")
         return True
 
@@ -1128,7 +1150,7 @@ def list_announcements(include_hidden: bool, limit: int = 200) -> list[dict]:
             filters = [{"and": and_list}]
 
     query = {
-        "database_id": ANNOUNCE_DB_ID,
+        "database_id": (_normalize_notion_id(ANNOUNCE_DB_ID) or ANNOUNCE_DB_ID),
         "page_size": 100,
         "sorts": [{"property": "發布日期", "direction": "descending"}] if "發布日期" in props_meta else [{"timestamp": "created_time", "direction": "descending"}],
     }
