@@ -2046,7 +2046,19 @@ def upsert_overtime_rule_to_notion(y: int, m: int, shift_hours: float, hourly_ra
             return _find_prop_by_type(fallback_type)
         return None
 
-    k_title = _resolve(["名稱", "name", "title"], fallback_type="title")
+    k_title = _find_prop_by_type("title")
+
+    # 有些情況會另外存在一個叫「名稱」的文字欄位（rich_text），而 Title 欄位本身可能被改名成別的。
+    # 這裡會：Title 一定寫入到 type=title 的欄位；若同時存在 rich_text 的「名稱」，也一併寫入，避免畫面看起來像沒填。
+    k_name_text: str | None = None
+    for _k, _v in (props_meta or {}).items():
+        try:
+            if _norm(_k) == _norm("名稱") and (_v or {}).get("type") == "rich_text":
+                k_name_text = _k
+                break
+        except Exception:
+            pass
+
     k_year  = _resolve(["年份", "年度", "year"], fallback_type="number")
     k_month = _resolve(["月份", "月", "month"], fallback_type="number")
     k_shift = _resolve(["班次換算時數", "換算時數", "班次時數", "shift", "hours"], fallback_type="number")
@@ -2054,11 +2066,13 @@ def upsert_overtime_rule_to_notion(y: int, m: int, shift_hours: float, hourly_ra
     k_note  = _resolve(["備註", "note", "備註說明"], fallback_type="rich_text")
 
     if not k_title:
-        raise RuntimeError("❌ 找不到加班設定表的 Title 欄位（名稱）")
+        raise RuntimeError(f"❌ 找不到加班設定表的 Title 欄位（type=title）。請確認資料庫存在可用的 Title 欄位。欄位清單：{list((props_meta or {}).keys())}")
 
     payload: dict = {
         k_title: {"title": [{"text": {"content": f"{int(y)}-{int(m):02d}"}}]}
     }
+    if k_name_text:
+        payload[k_name_text] = {"rich_text": [{"text": {"content": f"{int(y)}-{int(m):02d}"}}]}
 
     def _num(v):
         try:
