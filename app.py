@@ -438,32 +438,15 @@ def get_account_page_by_username(username: str) -> dict | None:
     except Exception:
         return None
 
-
-def _normalize_notion_id(raw: str | None) -> str | None:
-    """把 Notion 的 DB/Page ID（可能是 32 碼、帶 dash 的 UUID、或整段網址）統一成 Notion 可吃的 UUID 格式。"""
-    if not raw:
-        return None
-    s = str(raw).strip()
-    if not s:
-        return None
-
-    m = re.search(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", s)
-    if m:
-        return m.group(0).lower()
-
-    m = re.search(r"([0-9a-fA-F]{32})", s)
-    if not m:
-        return None
-
-    h = m.group(1).lower()
-    return f"{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
-
-
 @st.cache_data(ttl=60)
-def get_db_properties(database_id: str, force_refresh: bool = False) -> dict:
+def get_db_properties(database_id: str, force_refresh: bool = False, **_kwargs) -> dict:
+    """讀取 Notion DB schema（properties）。
+
+    - 支援 32 碼 / 帶 dash / 整段網址 的 database_id（會先 normalize）
+    - force_refresh 只是用來讓 cache key 變化，必要時繞過快取重新抓 schema
+    """
     try:
-        # NOTE: force_refresh 只是讓 cache key 變化，以便在需要時繞過快取重新抓 schema
-        _ = bool(force_refresh)
+        _ = bool(force_refresh)  # 讓 cache key 會因 force_refresh 改變
         dbid = _normalize_notion_id(database_id) or database_id
         db = notion.databases.retrieve(database_id=dbid)
         return db.get("properties", {}) or {}
@@ -473,8 +456,6 @@ def get_db_properties(database_id: str, force_refresh: bool = False) -> dict:
         if os.getenv("DEBUG_NOTION", "").strip() == "1":
             st.error(f"❌ Notion 讀取資料庫欄位失敗（{database_id}）：{e}")
         return {}
-
-
 
 @st.cache_data(ttl=60)
 def get_select_options(database_id: str, property_name: str) -> list[str]:
@@ -988,24 +969,10 @@ def _now_iso() -> str:
 
 
 def _make_announce_title(content: str, pub_date: date) -> str:
-    c = (content or "").strip().replace("\n", " ")
-    c = c[:20] + ("…" if len(c) > 20 else "")
-    return f"{pub_date.isoformat()}｜{c or '公告'}"
-
-
-def _norm_prop_name(s: str) -> str:
-    """把欄位名做輕量正規化（去空白/全形空白），避免 Notion 欄位名不小心多了空格導致對不上。"""
-    if s is None:
-        return ""
-    return str(s).replace("\u3000", " ").strip()
-
-
-def _prop_key_map(props_meta: dict) -> dict:
-    """normalized_name -> actual_key"""
-    m = {}
-    for k in (props_meta or {}).keys():
-        m[_norm_prop_name(k)] = k
-    return m
+    # ✅ Notion 的 title 必填：你現在不想用標題欄，因此用「內容前 3 個字」當作 title
+    c = (content or "").strip().replace("\n", " ").replace("\r", " ")
+    head = c[:3].strip()
+    return head or "公告"
 
 
 def create_announcement(publish_date: date, content: str, end_date: date | None, actor: str = "") -> bool:
@@ -1019,56 +986,65 @@ def create_announcement(publish_date: date, content: str, end_date: date | None,
         return False
 
     try:
-        props_meta = get_db_properties(ANNOUNCE_DB_ID) or {}
-        keymap = _prop_key_map(props_meta)
-        title_prop = resolve_title_prop_name(ANNOUNCE_DB_ID)  # 自動找 title 欄位
+        dbid = _normalize_notion_id(ANNOUNCE_DB_ID) or ANNOUNCE_DB_ID
+        props_meta = get_db_properties(dbid, force_refresh=True) or {}
 
-        def has_prop(n: str) -> bool:
-            return _norm_prop_name(n) in keymap
+        # 容錯：欄位名可能被你改成「內容」、或有空白/全形括號差異
+        def _norm(s: str) -> str:
+            if s is None:
+                return ""
+            s = str(s)
+            trans = str.maketrans({"（": "(", "）": ")", "　": " ", "\u00A0": " "})
+            s = s.translate(trans)
+            s = s.replace(" ", "")
+            return s.strip().lower()
 
-        def key(n: str) -> str:
-            return keymap[_norm_prop_name(n)]
+        def _find_prop(want: str, want_type: str | None = None) -> str | None:
+            wn = _norm(want)
+            for k, meta in (props_meta or {}).items():
+                if _norm(k) == wn and (want_type is None or (meta or {}).get("type") == want_type):
+                    return k
+            return None
 
-        props = {}
+        title_prop = resolve_title_prop_name(dbid)  # 自動找 type=title 的欄位名
+        done_prop = _find_prop("完成情況", "checkbox")
+        pub_prop = _find_prop("發布日期", "date")
+        end_prop = _find_prop("結束時間", "date")
 
-        # ✅ Title（Notion 必填）
-        if title_prop is not None:
+        # 公告內容欄位：優先找「公告內容」(rich_text)，找不到就改找「內容」(rich_text)
+        content_prop = _find_prop("公告內容", "rich_text") or _find_prop("內容", "rich_text")
+
+        props: dict = {}
+
+        # ✅ Title（Notion 必填）— 用內容前 3 字
+        if title_prop:
             props[title_prop] = {"title": [{"text": {"content": _make_announce_title(content, publish_date)}}]}
 
         # ✅ 完成情況（預設 False）
-        if has_prop("完成情況"):
-            props[key("完成情況")] = {"checkbox": False}
+        if done_prop:
+            props[done_prop] = {"checkbox": False}
 
         # ✅ 發布日期
-        if has_prop("發布日期"):
-            props[key("發布日期")] = {"date": {"start": datetime.combine(publish_date, datetime.min.time()).isoformat()}}
+        if pub_prop:
+            props[pub_prop] = {"date": {"start": datetime.combine(publish_date, datetime.min.time()).isoformat()}}
 
-        # ✅ 公告內容
-        if has_prop("公告內容"):
-            # rich_text
-            actual = key("公告內容")
-            if (props_meta.get(actual, {}) or {}).get("type") == "rich_text":
-                props[actual] = {"rich_text": [{"text": {"content": content}}]}
-            # 也有人把公告內容做成 title（就當備援）
-            elif (props_meta.get(actual, {}) or {}).get("type") == "title":
-                props[actual] = {"title": [{"text": {"content": content}}]}
-            else:
-                # 保底：仍用 rich_text 方式寫
-                props[actual] = {"rich_text": [{"text": {"content": content}}]}
+        # ✅ 公告內容（rich_text）
+        if content_prop:
+            props[content_prop] = {"rich_text": [{"text": {"content": content}}]}
 
         # ✅ 結束時間（可空）
-        if end_date and has_prop("結束時間"):
-            props[key("結束時間")] = {"date": {"start": datetime.combine(end_date, datetime.min.time()).isoformat()}}
+        if end_date and end_prop:
+            props[end_prop] = {"date": {"start": datetime.combine(end_date, datetime.min.time()).isoformat()}}
 
-        notion.pages.create(parent={"database_id": (_normalize_notion_id(ANNOUNCE_DB_ID) or ANNOUNCE_DB_ID)}, properties=props)
-        log_action(actor or "—", "公告管理", f"新增公告：{publish_date.isoformat()}｜{content[:30]}", "成功")
+        notion.pages.create(parent={"database_id": dbid}, properties=props)
+
+        log_action(actor or "—", "公告管理", f"新增公告：{publish_date.isoformat()} | {content[:30]}", "成功")
         return True
 
     except Exception as e:
         st.error(f"新增公告失敗：{e}")
-        log_action(actor or "—", "公告管理", f"新增公告失敗：{e}", "系統錯誤")
+        log_action(actor or "—", "公告管理", f"新增公告：{publish_date.isoformat()} | {content[:30]}", f"失敗：{e}")
         return False
-
 
 def mark_announcement_done(page_id: str, done: bool, actor: str = "") -> bool:
     if not ANNOUNCE_DB_ID:
@@ -1172,7 +1148,7 @@ def list_announcements(include_hidden: bool, limit: int = 200) -> list[dict]:
             filters = [{"and": and_list}]
 
     query = {
-        "database_id": (_normalize_notion_id(ANNOUNCE_DB_ID) or ANNOUNCE_DB_ID),
+        "database_id": ANNOUNCE_DB_ID,
         "page_size": 100,
         "sorts": [{"property": "發布日期", "direction": "descending"}] if "發布日期" in props_meta else [{"timestamp": "created_time", "direction": "descending"}],
     }
